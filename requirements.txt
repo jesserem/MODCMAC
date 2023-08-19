@@ -1,0 +1,4 @@
+gymnasium==0.28.1
+numpy==1.23.2
+pandas==2.0.2
+torch==2.0.1
