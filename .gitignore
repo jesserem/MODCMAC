@@ -5,3 +5,15 @@
 /runs/
 __pycache__
 /tests/.pytest_cache/
+
+# Environments
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
+
+.idea/
+.DS_Store
