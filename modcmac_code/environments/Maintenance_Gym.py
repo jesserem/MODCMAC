@@ -53,7 +53,6 @@ class MaintenanceEnv(gym.Env):
         action_comp, action_glob = self.get_action(action)
 
         cost = self.immediate_cost(action_glob, action_comp)
-        #TODO: DRAAI OM
 
         self.state = self.state_prime(self.state, action_comp)
         failure_cost = self.failure_mode(self.state)
