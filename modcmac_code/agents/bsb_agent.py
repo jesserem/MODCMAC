@@ -11,9 +11,8 @@ class BSB:
     def act(self, obs):
         obs = obs.squeeze()
         action_probs = np.zeros((self.env.ncomp, self.env.nacomp))
-        state1 = np.zeros((self.env.ncomp))
+        state1 = np.zeros(self.env.ncomp)
         for i in range(self.env.ncomp):
-
             state1[i] = obs[i, 0]
             action_probs[i, 0] = obs[i, 0] + obs[i, 1] * 0.5
             action_probs[i, 1] = obs[i, 1] * 0.5 + obs[i, 2]
