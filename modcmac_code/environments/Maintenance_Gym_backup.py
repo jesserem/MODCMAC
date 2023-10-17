@@ -208,52 +208,28 @@ class MaintenanceEnv(gym.Env):
         collapse_fail : float
             Failure probability of the components of the current state
         """
-        fail_state_before = (np.argmax(s, axis=1) == self.nstcomp - 2).astype(int)
         fail_state = (np.argmax(s, axis=1) == self.nstcomp - 1).astype(int)
         fail_prob = 1
         # FAIL MODE 1
         for i in range(self.f_modes[0].shape[0]):
-            n_almost_fail = np.sum(fail_state_before[self.f_modes[0][i, :]])
             n_fail = np.sum(fail_state[self.f_modes[0][i, :]])
-            if n_almost_fail == 1 and n_fail == 0:
-                fail_prob *= (1 - 0.001)
-            elif n_almost_fail == 2 and n_fail == 0:
-                fail_prob *= (1 - 0.008)
-            elif n_almost_fail == 3 and n_fail == 0:
-                fail_prob *= (1 - 0.015)
-            elif n_fail == 1 and n_almost_fail == 0:
+            if n_fail == 1:
                 fail_prob *= (1 - 0.01)
-            elif n_fail == 1 and n_almost_fail == 1:
-                fail_prob *= (1 - 0.015)
-            elif n_fail == 1 and n_almost_fail == 2:
-                fail_prob *= (1 - 0.03)
-            elif n_fail == 2 and n_almost_fail == 0:
+            elif n_fail == 2:
                 fail_prob *= (1 - 0.10)
-            elif n_fail == 2 and n_almost_fail == 1:
-                fail_prob *= (1 - 0.20)
             elif n_fail == 3:
                 fail_prob *= (1 - 0.40)
         # FAIL MODE 2
         for i in range(self.f_modes[1].shape[0]):
-            n_almost_fail = np.sum(fail_state_before[self.f_modes[0][i, :]])
             n_fail = np.sum(fail_state[self.f_modes[1][i, :]])
-            if n_fail == 0 and n_almost_fail == 1:
-                fail_prob *= (1 - 0.003)
-            elif n_fail == 0 and n_almost_fail == 2:
-                fail_prob *= (1 - 0.025)
-            elif n_fail == 1 and n_almost_fail == 0:
+            if n_fail == 1:
                 fail_prob *= (1 - 0.03)
-            elif n_fail == 1 and n_almost_fail == 1:
-                fail_prob *= (1 - 0.05)
             elif n_fail == 2:
                 fail_prob *= (1 - 0.33)
         # FAIL MODE 3
         for i in range(self.f_modes[2].shape[0]):
-            n_almost_fail = np.sum(fail_state_before[self.f_modes[0][i, :]])
             n_fail = np.sum(fail_state[self.f_modes[2][i, :]])
-            if n_almost_fail == 1:
-                fail_prob *= (1 - 0.005)
-            elif n_fail == 1:
+            if n_fail == 1:
                 fail_prob *= (1 - 0.05)
         collapse_fail = np.log(fail_prob)
         return collapse_fail

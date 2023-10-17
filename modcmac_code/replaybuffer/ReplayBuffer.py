@@ -143,3 +143,72 @@ class Memory(object):
 
         batch = BatchTransition(*[torch.cat(i) for i in zip(*batch)], device=self.device)
         return batch
+
+
+class replay_buffer_sec(object):
+    def __init__(self, buffer_size, ncomp, nstcomp, nacomp, nacomp_global, n_objectives, replace=False, device="cpu"):
+        self.buffer_size = buffer_size
+        self.buffer_belief = torch.zeros((self.buffer_size, ncomp, nstcomp, 1))  # damage state memory
+        self.buffer_belief_next = torch.zeros((self.buffer_size, ncomp, nstcomp, 1))
+        self.buffer_time = torch.zeros((self.buffer_size))  # time step memory
+        self.buffer_action = torch.zeros((self.buffer_size, ncomp), dtype=torch.int)  # action memory
+        self.buffer_action_global = torch.zeros(self.buffer_size, dtype=torch.int)
+        self.buffer_accrued_reward = torch.zeros((self.buffer_size, n_objectives))  # cost memory
+        self.buffer_accrued_reward_next = torch.zeros((self.buffer_size, n_objectives))  # cost memory
+        self.buffer_behavior_ac = torch.zeros((self.buffer_size, ncomp, nacomp))  # policy probability memory
+        self.buffer_behavior_ac_global = torch.zeros((self.buffer_size, ncomp, nacomp_global))
+        self.buffer_terminal_flag = torch.zeros(self.buffer_size)  # terminal state memory
+        self.buffer_gamma = torch.zeros(self.buffer_size)
+        self.i = 0
+        self.device = device
+        self.num_in_buffer = 0
+        self.replace = replace
+
+    """
+    Add batch to buffer.
+    """
+
+    def add(self, belief, belief_next, time, action, action_global, accrued_reward, accrued_reward_next, behavior_ac,
+            behavior_ac_global, terminal_flag, gamma):
+        self.buffer_belief[self.i] = belief
+        self.buffer_belief_next[self.i] = belief_next
+        self.buffer_time[self.i] = time
+        self.buffer_action[self.i] = action
+        self.buffer_action[self.i] = action_global
+        self.buffer_accrued_reward[self.i] = accrued_reward
+        self.buffer_accrued_reward_next[self.i] = accrued_reward_next
+        self.buffer_behavior_ac[self.i] = behavior_ac
+        self.buffer_behavior_ac_global[self.i] = behavior_ac_global
+        self.buffer_terminal_flag[self.i] = terminal_flag
+        self.buffer_gamma[self.i] = gamma
+        self.i = (self.i + 1) % self.buffer_size
+        self.num_in_buffer = min(self.num_in_buffer + 1, self.buffer_size)
+
+    """
+    Sample a batch of data from the buffer
+    """
+
+    def sample(self, batch_size):
+        idx = np.random.choice(self.num_in_buffer, batch_size, replace=self.replace)
+        batch_buffer_belief = self.buffer_belief[idx].to(self.device)
+        batch_buffer_belief_next = self.buffer_belief_next[idx].to(self.device)
+        batch_buffer_time = self.buffer_time[idx].to(self.device)
+        batch_buffer_action = self.buffer_action[idx].to(self.device)
+        batch_buffer_action_global = self.buffer_action_global[idx]
+        batch_buffer_accrued_reward = self.buffer_accrued_reward[idx].to(self.device)
+        batch_buffer_accrued_reward_next = self.buffer_accrued_reward_next[idx].to(self.device)
+        batch_buffer_behaviour_ac = self.buffer_behavior_ac[idx].to(self.device)
+        batch_buffer_behaviour_ac_global = self.buffer_behavior_ac_global[idx].to(self.device)
+        batch_buffer_terminal_flag = self.buffer_terminal_flag[idx].to(self.device)
+        batch_buffer_gamma = self.buffer_gamma[idx].to(self.device)
+        return (batch_buffer_belief, batch_buffer_belief_next, batch_buffer_time, batch_buffer_action,
+                batch_buffer_action_global, batch_buffer_accrued_reward, batch_buffer_accrued_reward_next,
+                batch_buffer_behaviour_ac, batch_buffer_behaviour_ac_global, batch_buffer_terminal_flag,
+                batch_buffer_gamma)
+
+    """
+    Check if there are enough samples for the batch size
+    """
+
+    def check_enough(self, batch_size):
+        return self.num_in_buffer >= batch_size

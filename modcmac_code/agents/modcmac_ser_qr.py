@@ -4,21 +4,109 @@ import torch
 import torch.optim as optim
 import os
 import torch.nn as nn
-from .modcmac_base import MODCMACBase
+import wandb
+
+from ..networks.model import PNet as PnetOrig, VNetSERQR as VnetOrig
 import numpy as np
 from collections.abc import Iterable
 from itertools import product
-
+from .modcmac_base import MODCMACBase
+from torch.utils.tensorboard import SummaryWriter
 from torch.distributions import Categorical
 from ..replaybuffer.ReplayBuffer import Memory as ReplayBuffer, Transition
 from datetime import datetime
 from time import time
 from gymnasium import Env
 from typing import Optional, Union, List, Callable, Tuple
-import wandb
 
 
-class MODCMAC(MODCMACBase):
+def explained_variance(y_pred: np.ndarray, y_true: np.ndarray) -> np.ndarray:
+    """
+    Computes fraction of variance that ypred explains about y.
+    Returns 1 - Var[y-ypred] / Var[y]
+
+    interpretation:
+        ev=0  =>  might as well have predicted zero
+        ev=1  =>  perfect prediction
+        ev<0  =>  worse than just predicting zero
+
+    :param y_pred: the prediction
+    :param y_true: the expected value
+    :return: explained variance of ypred and y
+    """
+    assert y_true.ndim == 1 and y_pred.ndim == 1
+    var_y = np.var(y_true)
+    return np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
+
+
+def quantile_huber_loss(
+        current_quantiles: torch.Tensor,
+        target_quantiles: torch.Tensor,
+        cum_prob: Optional[torch.Tensor] = None,
+        sum_over_quantiles: bool = True,
+) -> torch.Tensor:
+    """
+    The quantile-regression loss, as described in the QR-DQN and TQC papers.
+    Partially taken from https://github.com/bayesgroup/tqc_pytorch.
+
+    :param current_quantiles: current estimate of quantiles, must be either
+        (batch_size, n_quantiles) or (batch_size, n_critics, n_quantiles)
+    :param target_quantiles: target of quantiles, must be either (batch_size, n_target_quantiles),
+        (batch_size, 1, n_target_quantiles), or (batch_size, n_critics, n_target_quantiles)
+    :param cum_prob: cumulative probabilities to calculate quantiles (also called midpoints in QR-DQN paper),
+        must be either (batch_size, n_quantiles), (batch_size, 1, n_quantiles), or (batch_size, n_critics, n_quantiles).
+        (if None, calculating unit quantiles)
+    :param sum_over_quantiles: if summing over the quantile dimension or not
+    :return: the loss
+    """
+    if current_quantiles.ndim != target_quantiles.ndim:
+        raise ValueError(
+            f"Error: The dimension of curremt_quantile ({current_quantiles.ndim}) needs to match "
+            f"the dimension of target_quantiles ({target_quantiles.ndim})."
+        )
+    if current_quantiles.shape[0] != target_quantiles.shape[0]:
+        raise ValueError(
+            f"Error: The batch size of curremt_quantile ({current_quantiles.shape[0]}) needs to match "
+            f"the batch size of target_quantiles ({target_quantiles.shape[0]})."
+        )
+    if current_quantiles.ndim not in (2, 3):
+        raise ValueError(
+            f"Error: The dimension of current_quantiles ({current_quantiles.ndim}) needs to be either 2 or 3.")
+
+    if cum_prob is None:
+        n_quantiles = current_quantiles.shape[-1]
+        # Cumulative probabilities to calculate quantiles.
+        cum_prob = (torch.arange(n_quantiles, device=current_quantiles.device, dtype=torch.float) + 0.5) / n_quantiles
+        if current_quantiles.ndim == 2:
+            # For QR-DQN, current_quantiles have a shape (batch_size, n_quantiles), and make cum_prob
+            # broadcastable to (batch_size, n_quantiles, n_target_quantiles)
+            cum_prob = cum_prob.view(1, -1, 1)
+        elif current_quantiles.ndim == 3:
+            # For TQC, current_quantiles have a shape (batch_size, n_critics, n_quantiles), and make cum_prob
+            # broadcastable to (batch_size, n_critics, n_quantiles, n_target_quantiles)
+            cum_prob = cum_prob.view(1, 1, -1, 1)
+
+    # QR-DQN
+    # target_quantiles: (batch_size, n_target_quantiles) -> (batch_size, 1, n_target_quantiles)
+    # current_quantiles: (batch_size, n_quantiles) -> (batch_size, n_quantiles, 1)
+    # pairwise_delta: (batch_size, n_target_quantiles, n_quantiles)
+    # TQC
+    # target_quantiles: (batch_size, 1, n_target_quantiles) -> (batch_size, 1, 1, n_target_quantiles)
+    # current_quantiles: (batch_size, n_critics, n_quantiles) -> (batch_size, n_critics, n_quantiles, 1)
+    # pairwise_delta: (batch_size, n_critics, n_quantiles, n_target_quantiles)
+    # Note: in both cases, the loss has the same shape as pairwise_delta
+    pairwise_delta = target_quantiles.unsqueeze(-2) - current_quantiles.unsqueeze(-1)
+    abs_pairwise_delta = torch.abs(pairwise_delta)
+    huber_loss = torch.where(abs_pairwise_delta > 1, abs_pairwise_delta - 0.5, pairwise_delta ** 2 * 0.5)
+    loss = torch.abs(cum_prob - (pairwise_delta.detach() < 0).float()) * huber_loss
+    if sum_over_quantiles:
+        loss = loss.sum(dim=-2).mean()
+    else:
+        loss = loss.mean()
+    return loss
+
+
+class MODCMAC_SER_QR(MODCMACBase):
     """
     MO_DCMAC (Multi-Objective Deep Continuous Actor-Critic) class for reinforcement learning.
 
@@ -88,53 +176,30 @@ class MODCMAC(MODCMACBase):
     """
 
     def __init__(self, pnet: torch.nn.Module, vnet: torch.nn.Module, env: Env, ncomp: int, nstcomp: int, nacomp: int,
-                 naglobal: int,
-                 utility: Callable[[torch.Tensor], torch.Tensor], lr_critic: float = 0.001, lr_policy: float = 0.0001,
-                 device: Optional[str] = None, buffer_size: int = 1000, gamma: float = 0.975, name: str = "MO_DCMAC",
-                 save_folder: str = "./models", use_lr_scheduler: bool = True, num_episodes: int = 500_000,
-                 eval_only: bool = False, ep_length: int = 50, v_min: Union[List, float] = -10,
-                 v_max: Union[List, float] = 0, c: int = 11, n_step_update: int = 1, v_coef: float = 0.5,
-                 e_coef: float = 0.01, clip_grad_norm: Optional[int] = None, do_eval_every: int = 1000,
-                 use_accrued_reward: bool = True, n_eval: int = 100, log_run: bool = True):
+                 naglobal: int, utility: Callable[[torch.Tensor], torch.Tensor], lr_critic: float = 0.001,
+                 lr_policy: float = 0.0001, device: Optional[str] = None, buffer_size: int = 1000, gamma: float = 0.975,
+                 name: str = "MODCMAC_SER", save_folder: str = "./models", use_lr_scheduler: bool = True,
+                 num_episodes: int = 500_000, eval_only: bool = False, ep_length: int = 50, c: int = 11,
+                 n_step_update: int = 1, v_coef: float = 0.5, e_coef: float = 0.01,
+                 clip_grad_norm: Optional[int] = None, do_eval_every: int = 1000, use_accrued_reward: bool = True,
+                 n_eval: int = 100, log_run: bool = True):
+
         super().__init__(pnet, vnet, env, ncomp, nstcomp, nacomp, naglobal, utility, lr_critic, lr_policy, device,
                          buffer_size, gamma, name, save_folder, use_lr_scheduler, num_episodes, eval_only, ep_length,
                          n_step_update, v_coef, e_coef, clip_grad_norm, do_eval_every, use_accrued_reward, n_eval,
                          log_run)
 
         self.c = c
-
-        if not isinstance(v_min, Iterable):
-            v_min = [v_min] * self.n_objectives
-        if not isinstance(v_max, Iterable):
-            v_max = [v_max] * self.n_objectives
-        self.v_min = torch.tensor(v_min).to(self.device)
-        self.v_max = torch.tensor(v_max).to(self.device)
-
-        self.d_z = (self.v_max - self.v_min) / (self.c - 1.)
-        # [C51 nO]
-        self.z = torch.arange(c)[:, None].to(self.device) * self.d_z + self.v_min
-        # get the utility of every possible V-value (meshgrid over objectives: *[nO Batch])
-        r_ = torch.stack(torch.meshgrid(*self.z.T, indexing="xy"), dim=-1)
-
-        self.r_z = r_.unsqueeze(0)  # [1 C51 .. c51 nO]
-
-        self.u_z = self.utility(r_.view(-1, self.n_objectives)).view(1, *([self.c] * self.n_objectives))  # constant
-
-        self.accrued = torch.tensor([]).view(0, self.n_objectives)
         self.hparams = {
             "clip_grad_norm": self.clip_grad_norm,
             "n_step_update": self.n_step_update,
             "v_coef": self.v_coef,
             "e_coef": self.e_coef,
             "gamma": self.gamma,
-            "bins": self.c,
             "lr_critic": self.lr_critic,
             "lr_policy": self.lr_policy,
             "use_accrued_reward": self.use_accrued_reward,
-            "v_min_cost": v_min[0],
-            "v_max_cost": v_max[0],
-            "v_min_risk": v_min[1],
-            "v_max_risk": v_max[1],
+            "bins": self.c
         }
 
     def learn(self) -> Tuple[float, float, float, int]:
@@ -153,72 +218,44 @@ class MODCMAC(MODCMACBase):
             The number of updates performed NOTE: This is legacy code and should be removed.
         """
         batch = self.buffer.last(self.n_step_update)
-        with torch.no_grad():
-            p_ns = self.Vnet(batch.belief_next.squeeze(1))
 
-            non_terminal = torch.logical_not(batch.terminal).unsqueeze(1)
+        with torch.no_grad():
+            p_ns = self.Vnet(batch.belief_next)
+
+            non_terminal = torch.logical_not(batch.terminal)
             s_ = batch.reward.shape
 
             # [Batch C51 nO]
-            returns = batch.reward.unsqueeze(1).expand(s_[0], self.c, s_[1]).clone()
+            returns = batch.reward.unsqueeze(2).expand(s_[0], s_[1], self.c).clone()
 
-            # [C51 nO] + gamma*[C51 nO]*[1 1] -> [C51 nO]
-            returns[-1] += self.gamma * self.z * non_terminal[-1]
+            returns[-1] += self.gamma * p_ns[-1] * non_terminal[-1]
+            # print(returns.shape)
 
             for i in range(len(returns) - 1, 0, -1):
                 # if episode ended in last n-steps, do not add to return
                 returns[i - 1] += self.gamma * returns[i] * non_terminal[i - 1]
-            tz = torch.stack(
-                [returns[..., o].clamp(min=self.v_min[o], max=self.v_max[o]) for o in range(len(self.v_min))], dim=-1)
-            b = (tz - self.v_min) / self.d_z
-            l = torch.floor(b).long()
-            # change b to not be exactly on border of categories
-            b = torch.where(b != l, b, b - self.d_z / 100)
-            b = b.clamp(min=0, max=self.c - 1)
-            u = torch.ceil(b).long()
-            m = torch.zeros_like(p_ns)
-            i_s = torch.arange(len(returns))
-            # for each objective, for each category, get lower and upper neighbour
-            for c_i in product(range(self.c), repeat=self.n_objectives):
-                b_i = [b[i_s, c_i[j], j] for j in range(self.n_objectives)]  # b_i..k
-                l_i = [l[i_s, c_i[j], j] for j in range(self.n_objectives)]
-                u_i = [u[i_s, c_i[j], j] for j in range(self.n_objectives)]
-                # (b - floor(b))
-                nl_i = [(b_j - l_j) for b_j, l_j in zip(b_i, l_i)]
-                # (ceil(b) - b)
-                nu_i = [(u_j - b_j) for b_j, u_j in zip(b_i, u_i)]
-                lower_or_upper_i = [l_i, u_i]
-                lower_or_upper_p = [nu_i, nl_i]
-                current_i = (i_s,) + c_i
-                # for each combination of lower, upper neighbour, update probabilities
-                for n_i in product(range(2), repeat=self.n_objectives):
-                    # tuple (Batch, neighbour[0], ..., neighbour[n])
-                    neighbour_i = (i_s,) + tuple(lower_or_upper_i[j][i] for i, j in enumerate(n_i))
-                    neighbour_p = [lower_or_upper_p[j][i] for i, j in enumerate(n_i)]
-                    m[neighbour_i] += p_ns[current_i] * torch.stack(neighbour_p).prod(dim=0)
+
+            assert returns.shape == (self.n_step_update, self.n_objectives, self.c)
+
         p_s = self.Vnet(batch.belief)
 
-        objective_dims = tuple(range(1, len(p_s.shape)))
-        critic_loss = -torch.sum(m * torch.log(p_s), dim=objective_dims).unsqueeze(-1)
+        loss = torch.zeros((self.n_step_update, self.n_objectives))
+
+        # exit()
+        for i in range(self.n_objectives):
+            loss[:, i] = quantile_huber_loss(p_s[:, i, :], returns[:, i, :], sum_over_quantiles=False)
+
+        critic_loss = loss.mean(dim=1).unsqueeze(-1)
         with torch.no_grad():
-            # expand accrued from [Batch nO] to [Batch 1 .. 1 nO]
-            accrued = self.accrued[:-1].view(len(returns), *(1,) * self.n_objectives, self.n_objectives).to(self.device)
-            gamma = batch.gamma.view(len(returns), *(1,) * (self.n_objectives + 1))
-            # shift back discounted return: accrued + gamma^t*R_t
-            accrued_v = accrued + gamma * self.r_z
-            u_v_s = self.utility(accrued_v.view(-1, self.n_objectives)).view_as(p_s)
-            # expected utility for current state [Batch C51 .. C51]*[Batch C51 .. C51] -> [Batch]
-            u_v_s = torch.sum(u_v_s * p_s, dim=objective_dims)
-            # get all combinations of n0,n1,... (so C51 goes to c51**nO)
-            o_n = torch.meshgrid(*[torch.arange(self.c) for _ in range(self.n_objectives)], indexing="xy")
-            # [Batch C51 .. C51 nO]
-            r_z = torch.stack(tuple(returns[:, o_i, i] for i, o_i in enumerate(o_n)), dim=-1)
-            accrued_r = accrued + gamma * r_z
-            # compute the utility for all these returns [Batch C51 .. C51]
-            u_r_s = self.utility(accrued_r.view(-1, self.n_objectives)).view_as(p_s)
-            # expected utility using n-step returns: [Batch]
-            u_r_s = torch.sum(u_r_s * p_ns[-1].unsqueeze(0), dim=objective_dims)
-            advantage = u_r_s - u_v_s
+            value_next = p_ns.mean(dim=2)
+            value_curr = p_s.mean(dim=2)
+            gamma = batch.gamma.unsqueeze(1)
+
+        uti_next = self.utility(
+            (self.accrued[:-1] + gamma * batch.reward) + ((self.gamma * gamma) * value_next.clamp(max=0)))
+        uti_curr = self.utility(self.accrued[:-1] + (gamma * value_curr.detach().clamp(max=0)))
+
+        advantage = uti_next - uti_curr
 
         pi_ac_comp, pi_ac_glob = self.Pnet(batch.belief)
         pi_ac_comp = pi_ac_comp.softmax(dim=2)
@@ -252,7 +289,7 @@ class MODCMAC(MODCMACBase):
         entropy += dist.entropy()
 
         actor_loss = torch.sum(log_prob, dim=0) * advantage.detach()
-
+        # print(critic_loss.shape)
         loss = actor_loss + self.v_coef * critic_loss - self.e_coef * entropy
         self.optim.zero_grad()
         loss = loss.mean()
@@ -264,5 +301,18 @@ class MODCMAC(MODCMACBase):
 
         self.optim.step()
         self.accrued = self.accrued[-1:]
+        if self.log_run:
+            exp_var_arr = np.zeros(self.n_objectives)
+
+            for i in range(self.n_objectives):
+                exp_var_arr[i] = explained_variance(value_curr[:, i].detach().numpy(), returns[:, i, 0].numpy())
+            res_dict = {
+                f"debugging_{self.name}/explained_variance_cost": exp_var_arr[0],
+                f"global_step": self.total_steps
+            }
+            if not np.isnan(exp_var_arr).any():
+                res_dict[f"debugging_{self.name}/explained_variance_risk"] = exp_var_arr[1]
+                res_dict[f"debugging_{self.name}/explained_variance"] = np.mean(exp_var_arr)
+            wandb.log(res_dict)
 
         return actor_loss.mean().item(), critic_loss.mean().item(), entropy.mean().item(), 1

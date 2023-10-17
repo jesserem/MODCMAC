@@ -5,7 +5,7 @@
 /runs/
 __pycache__
 /tests/.pytest_cache/
-
+/other_scripts/
 
 # Environments
 .env
@@ -18,3 +18,10 @@ venv.bak/
 
 .idea/
 .DS_Store
+scenarios_json
+/wandb
+/test_run_results
+/models_old
+/wandb_init.py
+/test_matrix_multiplication.py
+/test_scenario.py
