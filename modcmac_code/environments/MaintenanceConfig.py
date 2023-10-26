@@ -1,11 +1,8 @@
-from modcmac_code.environments.Maintenance_Gym import MaintenanceEnv as maintenance_env
-from modcmac_code.environments.BeliefObservation import BayesianObservation
 import numpy as np
-import gymnasium as gym
-from modcmac_code.utils.utils import seed_everything
 
 
-def create_env():
+def get_quay_wall_config():
+    config = dict()
     ncomp = 13  # number of components
     ndeterioration = 50  # number of deterioration steps
     ntypes = 3  # number of component types
@@ -14,6 +11,14 @@ def create_env():
     nacomp = 3  # number of actions per component
     nobs = 5  # number of observations
     nfail = 3  # number of failure types
+    config['ncomp'] = ncomp
+    config['ndeterioration'] = ndeterioration
+    config['ntypes'] = ntypes
+    config['nstcomp'] = nstcomp
+    config['naglobal'] = naglobal
+    config['nacomp'] = nacomp
+    config['nobs'] = nobs
+    config['nfail'] = nfail
 
     """
     P: transition probability matrix, with dimensions (ndeterioration, ntypes, nstcomp, nstcomp)
@@ -76,6 +81,18 @@ def create_env():
     for i in range(ndeterioration):
         P[i, :, :] = P_start + (P_end - P_start) * i / (ndeterioration - 1)
 
+    config['P'] = P
+    # """
+    # F: failure probability matrix, with dimensions (ntypes, nstcomp)
+    #
+    # F is the probability of failure for each component type given the current state, if failed the component stays failed
+    # until replaced
+    # """
+    # F = np.zeros((ntypes, nstcomp))
+    # F[0] = np.array([0.0008, 0.0046, 0.0123, 0.0259, 1])
+    # F[1] = np.array([0.0012, 0.0073, 0.0154, 0.0324, 1])
+    # F[2] = np.array([0.0019, 0.0067, 0.0115, 0.0177, 1])
+
     """
     Observation matrix
     O_no: observation matrix for the no-inspection action
@@ -83,20 +100,35 @@ def create_env():
     O is the observation matrix for the inspect, no-inspect and replace action
     """
 
+    # O_no = np.array([[1, 0, 0, 0, 0],
+    #                  [1, 0, 0, 0, 0],
+    #                  [0, 0.25, 0.5, 0.25, 0],
+    #                  [0, 0, 0.5, 0.5, 0],
+    #                  [0, 0, 0, 0, 1]])
+    # O_no = np.array([[1, 0, 0, 0, 0],
+    #                  [1, 0, 0, 0, 0],
+    #                  [1, 0, 0, 0, 0],
+    #                  [1, 0, 0, 0, 0],
+    #                  [0, 0, 0, 0, 1]])
     O_in = np.eye(nstcomp)
+    # O_no = np.array([[1, 0, 0, 0, 0],
+    #                  [1, 0, 0, 0, 0],
+    #                  [0, 0, 0.34, 0.33, 0.33],
+    #                  [0, 0, 0.34, 0.33, 0.33],
+    #
+    #                  [0, 0, 0.34, 0.33, 0.33]])
     O_no = np.array([[1, 0, 0, 0, 0],
                      [1, 0, 0, 0, 0],
-                     [0, 0, 0.34, 0.33, 0.33],
-                     [0, 0, 0.34, 0.33, 0.33],
-
-                     [0, 0, 0.34, 0.33, 0.33]])
+                     [0, 0, 0, 0, 1],
+                     [0, 0, 0, 0, 1],
+                     [0, 0, 0, 0, 1]])
 
     O = np.zeros((2, nstcomp, nstcomp))
     O[0] = O_no
     O[1] = O_in
-
+    config['O'] = O
     repair_per = 0.25
-    inspect_per = 0.015
+    inspect_per = 0.05
 
     """
     Set the start state of the components
@@ -114,6 +146,7 @@ def create_env():
     start_state[12] = np.array([2])
     start_S = np.zeros((ncomp, nstcomp))
     start_S[np.arange(ncomp), start_state] = 1
+    config['start_S'] = start_S
 
     """
     TYPE 1: Wooden Pole, N=9, 40% of total cost
@@ -122,6 +155,7 @@ def create_env():
     """
 
     total_cost = 1
+    config['total_cost'] = total_cost
     inspect_cost = 0.005
 
     n_type1 = 9
@@ -136,11 +170,13 @@ def create_env():
 
     C_glo = np.zeros((1, naglobal))
     C_glo[0] = np.array([0, inspect_cost * total_cost])
+    config['C_glo'] = C_glo
 
     C_rep = np.zeros((ntypes, nacomp))
     C_rep[0] = np.array([0, repair_per * repla_cost_type1, repla_cost_type1])
     C_rep[1] = np.array([0, repair_per * repla_cost_type2, repla_cost_type2])
     C_rep[2] = np.array([0, repair_per * repla_cost_type3, repla_cost_type3])
+    config['C_rep'] = C_rep
 
     """
     Components that will be used for the simulation
@@ -153,6 +189,7 @@ def create_env():
     Comp: 12 Wooden Floor
     """
     comp_setup = np.array(([0] * 9) + ([1] * 3) + [2])
+    config['comp_setup'] = comp_setup
 
     """
     Failure Mode 1: Wooden Pole Failure. 3 substructures (0, 1, 2), (3, 4, 5), (6, 7, 8)
@@ -176,49 +213,7 @@ def create_env():
     f_mode_3[0] = np.array([12])
 
     f_modes = (f_mode_1, f_mode_2, f_mode_3)
-    test_env = maintenance_env(ncomp, ndeterioration, ntypes, nstcomp, naglobal, nacomp, nobs, nfail, P,
-                               O, C_glo, C_rep, comp_setup, f_modes, start_S, total_cost, ep_length=50)
-    return test_env
+    config['f_modes'] = f_modes
+    config['ep_length'] = 50
 
-
-def test_env_init():
-    test_env = create_env()
-    assert test_env.ncomp == 13, "Number of components is not correct"
-    assert test_env.ndeterioration == 50, "Number of deterioration steps is not correct"
-    assert test_env.ntypes == 3, "Number of component types is not correct"
-    assert test_env.nstcomp == 5, "Number of states per component is not correct"
-    assert test_env.naglobal == 2, "Number of global actions is not correct"
-    assert test_env.nacomp == 3, "Number of component actions is not correct"
-    assert test_env.nobs == 5, "Number of observations is not correct"
-    assert test_env.nfail == 3, "Number of failure modes is not correct"
-
-
-def test_seed():
-    env1 = BayesianObservation(gym.make("Maintenance-quay-wall-v0"))
-    env2 = BayesianObservation(gym.make("Maintenance-quay-wall-v0"))
-    # seed_everything(1)
-    for i in range(1, 11):
-        obs1, _ = env1.reset(seed=i)
-        action1 = env1.action_space.sample()
-        obs1, _, _, _, _ = env1.step(action1)
-
-        obs2, _ = env2.reset(seed=i)
-        obs2, _, _, _, _ = env2.step(action1)
-
-        assert np.allclose(obs1, obs2), "Seeding is not working correctly"
-
-
-def test_env_state():
-    test_env = create_env()
-    assert test_env.state.shape == (13, 5), "State shape is not correct"
-    assert test_env.state.dtype == np.float64, "State dtype is not correct"
-    assert test_env.state[0, 0] == 0, "State is not initialized correctly"
-
-
-def test_reset_env_state():
-    test_env = create_env()
-    test_env.reset()
-    assert test_env.state.shape == (13, 5), "State shape is not correct"
-    assert np.equal(test_env.state, test_env.start_S).all(), "State is not reset correctly"
-    assert np.equal(test_env.det_rate, np.zeros((13, 1), dtype=int)).all(), \
-        "Deterioration rate is not reset correctly"
+    return config

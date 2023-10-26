@@ -473,7 +473,6 @@ class MODCMAC_SER:
                     done = True
                 transition = Transition(belief=observation,
                                         belief_next=next_observation,
-                                        # time=torch.tensor(i / self.ep_length).float().view(1, 1),
                                         action=action.unsqueeze(0),
                                         behavior_ac_comp=behavior_ac_comp,
                                         behavior_ac_glob=behavior_ac_glob,

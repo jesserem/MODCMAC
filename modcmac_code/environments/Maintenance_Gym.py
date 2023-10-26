@@ -1,11 +1,12 @@
 import gymnasium as gym
 from gymnasium.spaces import MultiDiscrete, Box
+from gymnasium.utils import EzPickle
 import numpy as np
 from .scenario import Scenario
 from typing import Tuple, Optional, Dict, Any
 
 
-class MaintenanceEnv(gym.Env):
+class MaintenanceEnv(gym.Env, EzPickle):
     """
     The MaintenanceEnv class is the environment for the maintenance problem. The environment uses a discrete action
     and observation space. The action space is a MultiDiscrete space, where the first ncomp actions are the component
@@ -59,13 +60,17 @@ class MaintenanceEnv(gym.Env):
 
     def __init__(self, ncomp: int, ndeterioration: int, ntypes: int, nstcomp: int, naglobal: int, nacomp: int,
                  nobs: int, nfail: int, P: np.ndarray, O: np.ndarray, C_glo: np.ndarray, C_rep: np.ndarray,
-                 comp_setup: np.ndarray, f_modes: np.ndarray, start_S: np.ndarray, total_cost: float):
+                 comp_setup: np.ndarray, f_modes: np.ndarray, start_S: np.ndarray, total_cost: float, ep_length: int,
+                 render_mode: Optional[str] = None):
+        EzPickle.__init__(self, render_mode=render_mode)
+        self.render_mode = render_mode
         self.ncomp = ncomp
         self.start_S = start_S
         self.ndeterioration = ndeterioration
         self.ntypes = ntypes
         self.nstcomp = nstcomp
         self.total_cost = total_cost
+        self.ep_length = ep_length
 
         self.nacomp = nacomp
         self.naglobal = naglobal
@@ -83,7 +88,7 @@ class MaintenanceEnv(gym.Env):
         self.action_space = MultiDiscrete([self.nacomp] * self.ncomp + [self.naglobal])
         self.observation_space = MultiDiscrete(
             np.array([[self.nstcomp] * self.ncomp, [self.ndeterioration] * self.ncomp]))
-        self.reward_space = Box(np.array([-225000, -5]), np.array([0, 0]))
+        self.reward_space = Box(np.array([-1.0, -25.0]), np.array([0.0, 0.0]), dtype=np.float64)
 
         self.state = np.zeros((self.ncomp, self.nstcomp))
         self.det_rate = np.zeros((self.ncomp, 1), dtype=int)
@@ -110,7 +115,7 @@ class MaintenanceEnv(gym.Env):
         return action_comp, action_glob
 
     def reset(self, scenario: Optional[Scenario] = None, options: Optional[Dict[str, Any]] = None,
-              seed: Optional[int] = None, **kwargs) -> None:
+              seed: Optional[int] = None, **kwargs) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         Resets the environment. The state is set to the initial state and the deterioration rate is set to 0.
 
@@ -124,7 +129,7 @@ class MaintenanceEnv(gym.Env):
             Additional arguments
 
         """
-        super().reset(seed=seed)
+        super().reset(seed=seed, options=options)
         self.scenario = scenario
         if self.scenario is not None:
             if self.scenario.transitions.shape[0] != self.ncomp:
@@ -140,7 +145,7 @@ class MaintenanceEnv(gym.Env):
             self.state = np.copy(self.start_S)
             self.det_rate = np.zeros((self.ncomp, 1), dtype=int)
         self.curr_step = 0
-        return None
+        return self.observation(self.state, 0, np.zeros(self.ncomp)), {"state": self.state}
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, bool, bool, Dict[str, Any]]:
         """
@@ -184,7 +189,8 @@ class MaintenanceEnv(gym.Env):
 
         reward = np.array([cost, failure_cost])
         self.curr_step += 1
-        return return_observation, reward, terminated, False, {"state": self.state}
+        done = self.curr_step >= self.ep_length
+        return return_observation, reward, terminated, done, {"state": self.state}
 
     def failure_mode(self, s: np.ndarray) -> float:
         """

@@ -25,3 +25,7 @@ scenarios_json
 /wandb_init.py
 /test_matrix_multiplication.py
 /test_scenario.py
+/traffic_files
+/configs/
+/model_tuning/
+/modcmac_code/agents/ppo/

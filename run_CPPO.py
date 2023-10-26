@@ -1,11 +1,10 @@
 import numpy as np
 import torch
 import os
-from modcmac_code.agents.modcmac_ser_qr import MODCMAC_SER_QR
-from modcmac_code.agents.modcmac_ser_cat import MODCMAC_SER_CAT
-from modcmac_code.networks.model import PNet, VNetSERCat, VNetSERQR, VNetSER
+from modcmac_code.agents.ppo.cppo import CPPO
 from modcmac_code.environments.Maintenance_Gym import MaintenanceEnv
 from modcmac_code.environments.BeliefObservation import BayesianObservation
+from modcmac_code.networks.model import VNet, PNet
 import pandas as pd
 import argparse
 import signal
@@ -14,31 +13,31 @@ import sys
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="MO_DCMAC parameters")
-    parser.add_argument("--v_min_cost", type=float, default=-5.0, help="Minimum value of cost.")
+    parser.add_argument("--v_min_cost", type=float, default=-3.0, help="Minimum value of cost.")
     parser.add_argument("--v_max_cost", type=float, default=0.0, help="Maximum value of cost.")
-    parser.add_argument("--v_min_risk", type=float, default=-1.5, help="Minimum value of risk.")
+    parser.add_argument("--v_min_risk", type=float, default=-0.5, help="Minimum value of risk.")
     parser.add_argument("--v_max_risk", type=float, default=0.0, help="Maximum value of risk.")
     parser.add_argument("--clip_grad_norm", type=float, default=10, help="Gradient norm clipping value.")
     parser.add_argument("--c", type=int, default=11, help="Number of bins for critic.")
     parser.add_argument("--n_step_update", type=int, default=50, help="Number of steps for update.")
+    parser.add_argument("--episode_length", type=int, default=50, help="The length of the episode")
     parser.add_argument("--v_coef", type=float, default=0.5, help="Coefficient for value function.")
-    parser.add_argument("--e_coef", type=float, default=0.1, help="Coefficient for entropy.")
-    parser.add_argument("--lr_critic", type=float, default=0.00005, help="Learning rate for critic.")
+    parser.add_argument("--e_coef", type=float, default=0.01, help="Coefficient for entropy.")
+    parser.add_argument("--lr_critic", type=float, default=0.0005, help="Learning rate for critic.")
     parser.add_argument("--lr_policy", type=float, default=0.0005, help="Learning rate for policy.")
     parser.add_argument("--no_accrued_reward", action='store_false', help="Flag to use accrued reward.")
     parser.add_argument("--gamma", type=float, default=0.975, help="Discount factor.")
-    parser.add_argument("--episodes", type=int, default=500_000, help="Number of training episodes.")
-    parser.add_argument("--name", type=str, default="MO_DCMAC_SER", help="Name of the experiment.")
+    parser.add_argument("--num_steps", type=int, default=25_000_000, help="Number of training episodes.")
+    parser.add_argument("--name", type=str, default="MO_DCMAC", help="Name of the experiment.")
     parser.add_argument("--device", type=str, default="cpu", help="Device.", choices=["cpu", "cuda", "mps"])
     parser.add_argument("--save_folder", type=str, default="./models", help="Folder to save models.")
     parser.add_argument("--do_eval", action='store_true', help="Flag to do evaluation.")
     parser.add_argument("--path_pnet", type=str, default=None, help="Path to policy network.")
     parser.add_argument("--path_vnet", type=str, default=None, help="Path to value network.")
-    parser.add_argument("--type", type=str, default="normal", choices=["normal", "cat", "qr"], help="Type of network.")
+    parser.add_argument("--no_log", action="store_false", help="Flag to not log the run")
     parser.add_argument("--save_eval_folder", type=str, default=None, help="Folder to save evaluation results.")
 
     args = parser.parse_args()
-    print("Use Accrued", args.no_accrued_reward)
     if (args.do_eval and
             (args.path_pnet is None or args.path_vnet is None or args.save_eval_folder is None)):
         raise ValueError("You must specify the path to the policy and value networks, and save folder eval.")
@@ -166,7 +165,7 @@ O[0] = O_no
 O[1] = O_in
 
 repair_per = 0.25
-inspect_per = 0.015
+inspect_per = 0.05
 
 """
 Set the start state of the components
@@ -287,34 +286,18 @@ def main():
     else:
         clip_grad_norm = args.clip_grad_norm
     env = BayesianObservation(MaintenanceEnv(ncomp, ndeterioration, ntypes, nstcomp, naglobal, nacomp, nobs, nfail, P,
-                                             O, C_glo, C_rep, comp_setup, f_modes, start_S, total_cost))
-    print(args.name)
+                                             O, C_glo, C_rep, comp_setup, f_modes, start_S, total_cost,
+                                             ep_length=args.episode_length))
     pnet = PNet(ncomp, nstcomp, nacomp, naglobal, objectives=2, use_accrued_reward=args.no_accrued_reward)
-
-    if args.type == "cat":
-        vnet = VNetSERCat(ncomp, nstcomp, c=args.c, objectives=2, use_accrued_reward=args.no_accrued_reward)
-        agent = MODCMAC_SER_CAT(pnet, vnet, env, ncomp, nstcomp, nacomp, naglobal, utility=fmeca2,
-                                v_min=(args.v_min_cost, args.v_min_risk),
-                                v_max=(args.v_max_cost, args.v_max_risk), clip_grad_norm=clip_grad_norm, c=args.c,
-                                device=args.device,
-                                n_step_update=args.n_step_update, v_coef=args.v_coef, e_coef=args.e_coef,
-                                lr_critic=args.lr_critic,
-                                lr_policy=args.lr_policy, use_accrued_reward=args.no_accrued_reward, gamma=args.gamma,
-                                save_folder=args.save_folder, name="CAT_" + args.name, num_episodes=args.episodes,
-                                eval_only=args.do_eval)
-    elif args.type == "qr":
-        # exit()
-        vnet = VNetSERQR(ncomp, nstcomp, c=args.c, objectives=2, use_accrued_reward=args.no_accrued_reward)
-        agent = MODCMAC_SER_QR(pnet, vnet, env, ncomp, nstcomp, nacomp, naglobal, utility=fmeca2,
-                               clip_grad_norm=clip_grad_norm, c=args.c,
-                               device=args.device,
-                               n_step_update=args.n_step_update, v_coef=args.v_coef, e_coef=args.e_coef,
-                               lr_critic=args.lr_critic,
-                               lr_policy=args.lr_policy, use_accrued_reward=args.no_accrued_reward, gamma=args.gamma,
-                               save_folder=args.save_folder, name="QR_" + args.name, num_episodes=args.episodes,
-                               eval_only=args.do_eval)
-    else:
-        raise NotImplementedError
+    # exit()
+    vnet = VNet(ncomp, nstcomp, c=args.c, objectives=2, use_accrued_reward=args.no_accrued_reward)
+    agent = CPPO(pnet, vnet, env, utility=fmeca2, obj_names=['cost', 'risk'], log_run=args.no_log,
+                 v_min=(args.v_min_cost, args.v_min_risk), v_max=(args.v_max_cost, args.v_max_risk),
+                 clip_grad_norm=clip_grad_norm, c=args.c, device=args.device,
+                 v_coef=args.v_coef, e_coef=args.e_coef, lr_critic=args.lr_critic, do_eval_every=1000,
+                 lr_policy=args.lr_policy, use_accrued_reward=args.no_accrued_reward, gamma=args.gamma,
+                 save_folder=args.save_folder, name=args.name, num_steps=args.num_steps, eval_only=args.do_eval,
+                 project_name="CPPO_quay_wall")
 
     def signal_handler(sig, frame):
         print('You pressed Ctrl+C!')
@@ -323,10 +306,10 @@ def main():
 
     signal.signal(signal.SIGINT, signal_handler)
     if not args.do_eval:
-        agent.train_old(episodes=args.episodes)
+        agent.train(training_steps=args.num_steps)
     else:
         agent.load_model(args.path_pnet, args.path_vnet)
-        cost_array, risk_array, uti_array, scoring_table = agent.do_eval(2)
+        cost_array, risk_array, uti_array, scoring_table = agent.do_eval(5)
         print("Cost: ", np.mean(cost_array))
         print("Risk: ", np.mean(risk_array))
         print("Utility: ", np.mean(uti_array))

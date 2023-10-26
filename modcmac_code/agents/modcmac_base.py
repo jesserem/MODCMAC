@@ -1,17 +1,72 @@
 import sys
 
-import pandas as pd
+from ..distributions.distributions import MultiCategorical, MultiNormal
 import torch
 import torch.optim as optim
 import os
 import numpy as np
-from torch.distributions import Categorical
-from ..replaybuffer.ReplayBuffer import Memory as ReplayBuffer, Transition
+from torch.distributions import Categorical, Normal
+from ..replaybuffer.ReplayBuffer import Memory as ReplayBuffer, Transition, BatchTransition
 from datetime import datetime
 from time import time
 from gymnasium import Env
 from typing import Optional, Union, List, Callable, Tuple
+from torch import nn
 import wandb
+from dataclasses import dataclass
+
+
+class Log(object):
+    def __init__(self, n_objectives: int):
+        self.n_objectives = n_objectives
+        self.n_update = 0
+        self.n_episodes = 0
+        self.wandb_policy_loss = 0
+        self.wandb_value_loss = 0
+        self.wandb_entropy = 0
+        self.wandb_episode_utility = 0
+        self.wandb_episode_discounted_utility = 0
+        self.wandb_episode_reward = np.zeros(self.n_objectives)
+        self.wandb_episode_discounted_reward = np.zeros(self.n_objectives)
+
+    def add_losses(self, policy_loss: float, value_loss: float, entropy: float):
+        self.wandb_policy_loss += policy_loss
+        self.wandb_value_loss += value_loss
+        self.wandb_entropy += entropy
+        self.n_update += 1
+
+    def add_episode(self, utility: float, discounted_utility: float, reward: np.ndarray, discounted_reward: np.ndarray):
+        self.wandb_episode_utility += utility
+        self.wandb_episode_discounted_utility += discounted_utility
+        self.wandb_episode_reward += reward
+        self.wandb_episode_discounted_reward += discounted_reward
+        self.n_episodes += 1
+
+    def get_loss(self) -> Tuple[float, float, float]:
+        policy_loss = self.wandb_policy_loss / self.n_update
+        value_loss = self.wandb_value_loss / self.n_update
+        entropy = self.wandb_entropy / self.n_update
+        self.wandb_policy_loss = 0
+        self.wandb_value_loss = 0
+        self.wandb_entropy = 0
+        self.n_update = 0
+        return policy_loss, value_loss, entropy
+
+    def get_episode(self) -> Tuple[float, float, np.ndarray, np.ndarray]:
+        utility = self.wandb_episode_utility / self.n_episodes
+        discounted_utility = self.wandb_episode_discounted_utility / self.n_episodes
+        reward = self.wandb_episode_reward / self.n_episodes
+        discounted_reward = self.wandb_episode_discounted_reward / self.n_episodes
+        self.wandb_episode_utility = 0
+        self.wandb_episode_discounted_utility = 0
+        self.wandb_episode_reward = np.zeros(self.n_objectives)
+        self.wandb_episode_discounted_reward = np.zeros(self.n_objectives)
+        self.n_episodes = 0
+        return utility, discounted_utility, reward, discounted_reward
+
+    @property
+    def can_print(self):
+        return self.n_update > 0 and self.n_episodes > 0
 
 
 class MODCMACBase:
@@ -83,29 +138,35 @@ class MODCMACBase:
     Some attributes are derived from the provided arguments and are not directly provided as parameters.
     """
 
-    def __init__(self, pnet: torch.nn.Module, vnet: torch.nn.Module, env: Env, ncomp: int, nstcomp: int, nacomp: int,
-                 naglobal: int, utility: Callable[[torch.Tensor], torch.Tensor], lr_critic: float = 0.001,
+    def __init__(self, pnet: torch.nn.Module, vnet: torch.nn.Module, env: Env,
+                 utility: Callable[[torch.Tensor], torch.Tensor], lr_critic: float = 0.001,
                  lr_policy: float = 0.0001, device: Optional[str] = None, buffer_size: int = 1000, gamma: float = 0.975,
                  name: str = "MODCMAC_base", save_folder: str = "./models", use_lr_scheduler: bool = True,
-                 num_episodes: int = 500_000, eval_only: bool = False, ep_length: int = 50, n_step_update: int = 1,
+                 num_steps: int = 2_500_000, eval_only: bool = False, ep_length: int = 50, n_step_update: int = 1,
                  v_coef: float = 0.5, e_coef: float = 0.01, clip_grad_norm: Optional[int] = None,
-                 do_eval_every: int = 1000, use_accrued_reward: bool = True, n_eval: int = 100, log_run: bool = True):
-
+                 do_eval_every: int = 1000, use_accrued_reward: bool = True, update_wandb_step: int = 500,
+                 n_eval: int = 100, log_run: bool = False, obj_names: Optional[List[str]] = None,
+                 project_name: str = "modcmac_base", continuous: bool = False, normalize_advantage: bool = True,
+                 seed: Optional[int] = None, ):
+        self.seed = seed
+        self.np_random = np.random.default_rng(seed)
         self.use_accrued_reward = use_accrued_reward
+        self.normalize_advantage = normalize_advantage
+        self.update_wandb_step = update_wandb_step
+        self.continuous = continuous
         self.save_folder = save_folder
-        self.num_episodes = num_episodes
+        self.num_steps = num_steps
         self.use_lr_scheduler = use_lr_scheduler
         self.n_eval = n_eval
-        self.ncomp = ncomp
-        self.nstcomp = nstcomp
-        self.nacomp = nacomp
-        self.naglobal = naglobal
         self.eval_only = eval_only
         self.log_run = log_run
-        self.name = "{name}_{date}".format(name=name, date=datetime.now().strftime("%Y%m%d-%H%M%S"))
+        if self.seed is not None:
+            self.name = "{name}_seed_{seed}".format(name=name, seed=self.seed)
+        else:
+            self.name = "{name}_{date}".format(name=name, date=datetime.now().strftime("%Y%m%d-%H%M%S"))
         self.total_steps = 0
         self.do_eval_every = do_eval_every
-
+        self.project_name = project_name
         self.env = env
         self.utility = utility
         self.n_step_update = n_step_update
@@ -113,6 +174,14 @@ class MODCMACBase:
         self.e_coef = e_coef
         self.clip_grad_norm = clip_grad_norm
         self.n_objectives = np.prod(self.env.reward_space.shape)
+        if continuous:
+            self.distribution = MultiNormal
+        else:
+            self.distribution = MultiCategorical
+        if obj_names is None:
+            self.obj_names = [f"obj_{i + 1}" for i in range(self.n_objectives)]
+        else:
+            self.obj_names = obj_names
 
         if device is None and torch.cuda.is_available():
             self.device = "cuda"
@@ -131,9 +200,10 @@ class MODCMACBase:
         ])
         self.lr_policy_end = self.lr_policy * 0.1
         self.lr_critic_end = self.lr_critic * 0.1
-        lr_lambda_policy = lambda episode: 1 - (episode / self.num_episodes) * (
+        n_update_steps = self.num_steps // self.n_step_update
+        lr_lambda_policy = lambda step: 1 - (min(step, n_update_steps) / n_update_steps) * (
                 1 - (self.lr_policy_end / self.lr_policy))
-        lr_lambda_critic = lambda episode: 1 - (episode / self.num_episodes) * (
+        lr_lambda_critic = lambda step: 1 - (min(step, n_update_steps) / n_update_steps) * (
                 1 - (self.lr_critic_end / self.lr_critic))
         self.lr_scheduler = optim.lr_scheduler.LambdaLR(self.optim, lr_lambda=[lr_lambda_policy, lr_lambda_critic])
 
@@ -149,15 +219,16 @@ class MODCMACBase:
 
         self.accrued = torch.tensor([]).view(0, self.n_objectives)
         self.hparams = None
+        self.log = Log(self.n_objectives)
 
     def init_wandb(self) -> None:
         wandb.init(
-            project="modcmac",
+            project=self.project_name,
             name=self.name,
             config=self.hparams,
             save_code=True,
         )
-        wandb.define_metric("*", step_metric="global_step")
+        # wandb.define_metric("*", step_metric="global_step")
 
     def close_wandb(self) -> None:
         if self.log_run:
@@ -182,8 +253,7 @@ class MODCMACBase:
         torch.save(self.Pnet.state_dict(), os.path.join(self.model_path, f"Pnet_{name}.pt"))
         torch.save(self.Vnet.state_dict(), os.path.join(self.model_path, f"Vnet_{name}.pt"))
 
-    def select_action(self, observation: torch.Tensor, training: bool = True) -> Tuple[torch.Tensor, torch.Tensor,
-    torch.Tensor]:
+    def select_action(self, observation: torch.Tensor, training: bool = True) -> torch.Tensor:
         """
         Selects an action based on the given observation using the policy network (Pnet).
 
@@ -199,50 +269,19 @@ class MODCMACBase:
         --------
         action : torch.Tensor
             The selected action.
-        action_probs_comp : torch.Tensor
-            Probabilities of each action component.
-        action_probs_global : torch.Tensor
-            Probabilities of each global action.
 
-        Notes:
-        ------
-        - The `action` is a flattened tensor containing both component and global actions.
-        - `action_probs_comp` provides the probabilities of each action component for the given observation.
-        - `action_probs_global` provides the probabilities of each global action for the given observation.
         """
         observation = observation.to(self.device)
+        with torch.no_grad():
+            action_output = self.Pnet(observation)
+        action_dist = self.distribution(logits=action_output)
         if training:
-            with torch.no_grad():
-                action_output_comp, action_output_global = self.Pnet(observation)
-
-            action_dist_comp = Categorical(logits=action_output_comp)
-            action_probs_comp = action_dist_comp.probs
-            action_comp = action_dist_comp.sample()
-
-            action_dist_global = Categorical(logits=action_output_global)
-            action_probs_global = action_dist_global.probs
-            action_global = action_dist_global.sample()
-
-            action = torch.cat([action_comp.flatten(), action_global.flatten()], dim=0).cpu()
-            return action.flatten(), action_probs_comp.view(1, self.ncomp, self.nacomp), \
-                action_probs_global.view(1, 1, self.naglobal)
+            action = action_dist.sample().detach()
         else:
-            with torch.no_grad():
-                action_output_comp, action_output_global = self.Pnet(observation)
+            action = action_dist.get_best_action().detach()
+        return action
 
-            action_dist_comp = Categorical(logits=action_output_comp)
-            action_probs_comp = action_dist_comp.probs
-            action_comp = torch.argmax(action_probs_comp, dim=2)
-
-            action_dist_global = Categorical(logits=action_output_global)
-            action_probs_global = action_dist_global.probs
-            action_global = torch.argmax(action_probs_global, dim=1)
-
-            action = torch.cat([action_comp.flatten(), action_global.flatten()], dim=0).cpu()
-            return action.flatten(), action_probs_comp.view(1, self.ncomp, self.nacomp), \
-                action_probs_global.view(1, 1, self.naglobal)
-
-    def create_input(self, belief: torch.Tensor, i: int, accrued: torch.Tensor) -> torch.Tensor:
+    def create_input(self, observation: torch.Tensor, accrued: torch.Tensor) -> torch.Tensor:
         """
         Creates the input for the policy network (Pnet) based on the given belief state.
 
@@ -265,14 +304,11 @@ class MODCMACBase:
         The `observation` is a flattened tensor containing the belief state, the current time step, and the accrued
         rewards.
         """
-        i_torch = torch.tensor(i / self.ep_length).float().view(1, 1)
         if self.use_accrued_reward:
-            observation = torch.cat([belief.view(belief.size(0), -1), i_torch, accrued[-1:].float()], dim=1)
-        else:
-            observation = torch.cat([belief.view(belief.size(0), -1), i_torch], dim=1)
-        return observation
+            observation = torch.cat([observation.unsqueeze(0), accrued[-1:].float()], dim=1)
+        return observation.float()
 
-    def evaluate(self, scoring_table: Optional[np.ndarray] = None, run: int = 0) -> Tuple[
+    def evaluate_old(self, scoring_table: Optional[np.ndarray] = None, run: int = 0) -> Tuple[
         np.ndarray, int, bool, np.ndarray]:
         """
         Evaluates the policy on the environment for a single episode.
@@ -299,57 +335,20 @@ class MODCMACBase:
         else:
             observation = torch.cat([belief.view(belief.size(0), -1), i_torch], dim=1)
         accrued = torch.tensor([]).view(0, self.n_objectives)
-        reward = np.zeros(self.n_objectives)
+        total_reward = np.zeros(self.n_objectives)
         while not done:
-            action, behavior_ac_comp, behavior_ac_glob = self.select_action(observation,
-                                                                            training=False)  # select action
-            # columns = ["global_step", "timestep", "accrued_cost", "accrued_risk"]
+            action, behavior_ac_comp = self.select_action(observation, training=False)  # select action
 
-            next_belief, cost, done, trunc, info = self.env.step(action)
-            reward += cost
-            # for i in range(self.ncomp):
-            #     columns.append(f"comp_{i + 1}_state")
-            # for i in range(self.ncomp):
-            #     columns.append(f"comp_{i + 1}_belief")
-            # for i in range(self.ncomp):
-            #     columns.append(f"comp_{i + 1}_action")
-            # columns.append("global_action")
-            # state_input = (np.argmax(info["state"], axis=1).flatten() + 1).tolist()
-            # print(state_input)
-            # belief_input = belief.flatten().tolist()
-            # print(belief_input)
-            # action_input = action.flatten().tolist()
-            # print(action_input)
-            # print(len(state_input))
-            # print(len(belief_input))
-            # print(len(action_input))
-            # exit()
-            if scoring_table is not None:
-                state_input = (np.argmax(info["state"], axis=1).flatten() + 1).tolist()
-                belief_input = belief.flatten().tolist()
-                action_input = action.flatten().tolist()
-                scoring_table[i, 0] = run
-                scoring_table[i, 1] = i
-                scoring_table[i, 2] = reward[0]
-                scoring_table[i, 3] = reward[1]
-                # scoring_table[i, 4:4 + self.ncomp] = state_input
-                for s in range(len(state_input)):
-                    scoring_table[i, 4 + s] = state_input[s]
-                for b in range(len(belief_input)):
-                    scoring_table[i, 4 + len(state_input) + b] = belief_input[b]
-                for a in range(len(action_input)):
-                    scoring_table[i, 4 + len(state_input) + len(belief_input) + a] = action_input[a]
-            belief = next_belief
+            next_belief, reward, done, trunc, info = self.env.step(action)
+            total_reward += reward
 
-            # scoring_table.add_data(run, i, reward[0], reward[1], *state_input, *belief_input,
-            #                        *action_input)
             gamma = torch.tensor([self.gamma ** i])
-            cost_tensor = torch.tensor(cost).float().view(1, self.n_objectives)
+            reward_tensor = torch.tensor(reward).float().view(1, self.n_objectives)
             if i == 0:
-                accrued = torch.cat((accrued[:-1], torch.zeros_like(cost_tensor), cost_tensor), dim=0)
+                accrued = torch.cat((accrued[:-1], torch.zeros_like(reward_tensor), reward_tensor), dim=0)
             else:
-                accrued = torch.cat((accrued, accrued[-1] + gamma * cost_tensor), dim=0)
-            next_observation = self.create_input(torch.tensor(next_belief).float(), i + 1, accrued)
+                accrued = torch.cat((accrued, accrued[-1] + gamma * reward_tensor), dim=0)
+            next_observation = self.create_input_old(torch.tensor(next_belief).float(), i + 1, accrued)
             observation = next_observation
 
             if done:
@@ -358,9 +357,51 @@ class MODCMACBase:
                 done = True
             i += 1
 
-        return reward, i, has_failed, scoring_table
+        return total_reward, i, has_failed, scoring_table
 
-    def do_eval(self, episodes: int = 1000) -> Tuple[np.ndarray, np.ndarray, np.ndarray, pd.DataFrame]:
+    def evaluate(self, scoring_table: Optional[np.ndarray] = None, run: int = 0) -> Tuple[
+        np.ndarray, int, bool, np.ndarray]:
+        """
+        Evaluates the policy on the environment for a single episode.
+
+        Returns:
+        --------
+        reward : np.ndarray
+            The total reward for the episode.
+        i : int
+            The number of steps taken in the episode.
+        has_failed : bool
+            Whether the episode has failed or not.
+        """
+        done = False
+        has_failed = False
+        i = 0
+        observation, _ = self.env.reset()
+        observation = torch.tensor(observation).float()
+        observation = self.create_input(observation, torch.zeros((1, self.n_objectives)))
+        accrued = torch.tensor([]).view(0, self.n_objectives)
+        total_reward = np.zeros(self.n_objectives)
+
+        while not done:
+            action = self.select_action(observation, training=False)  # select action
+
+            next_observation, reward, done, trunc, info = self.env.step(action.detach().numpy())
+            done = done or trunc
+            total_reward += reward
+            gamma = torch.tensor([self.gamma ** i])
+            reward_tensor = torch.tensor(reward).float().view(1, self.n_objectives)
+            if i == 0:
+                accrued = torch.cat((accrued[:-1], torch.zeros_like(reward_tensor), reward_tensor), dim=0)
+            else:
+                accrued = torch.cat((accrued, accrued[-1] + gamma * reward_tensor), dim=0)
+            observation = self.create_input(torch.tensor(next_observation), accrued)
+            if done:
+                has_failed = True
+            i += 1
+
+        return total_reward, i, has_failed, scoring_table
+
+    def do_eval(self, episodes: int = 1000) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Evaluates the policy for a number of episodes, and returns the cost, risk and utility for each episode.
 
@@ -381,34 +422,19 @@ class MODCMACBase:
         reward_cost_array = np.zeros(episodes)
         reward_risk_array = np.zeros(episodes)
         reward_uti_array = np.zeros(episodes)
-        list_of_scoring_tables = []
-        columns = ["episode", "timestep", "accrued_cost", "accrued_risk"]
-        for i in range(self.ncomp):
-            columns.append(f"comp_{i + 1}_state")
-        for i in range(self.ncomp):
-            for j in range(self.nstcomp):
-                columns.append(f"comp_{i + 1}_state_{j + 1}_belief")
-        for i in range(self.ncomp):
-            columns.append(f"comp_{i + 1}_action")
-        columns.append("global_action")
         for i in range(episodes):
-            curr_scoring_table = np.zeros((self.ep_length, len(columns)))
-            reward, _, _, scoring_table = self.evaluate(scoring_table=curr_scoring_table, run=i)
-            # print(curr_scoring_table)
-            # exit()
-            list_of_scoring_tables.append(scoring_table)
+            reward, _, _, scoring_table = self.evaluate()
+
             total_cost_eval_curr = np.abs(reward[0])
             total_prob_eval_curr = 1 - np.exp(reward[1])
             eval_cost_curr = np.abs(self.utility(torch.tensor(reward).view(1, self.n_objectives)).item())
             reward_cost_array[i] = total_cost_eval_curr
             reward_risk_array[i] = total_prob_eval_curr
             reward_uti_array[i] = eval_cost_curr
-        scoring_table = np.vstack(list_of_scoring_tables)
-        scoring_table = pd.DataFrame(scoring_table, columns=columns)
 
-        return reward_cost_array, reward_risk_array, reward_uti_array, scoring_table
+        return reward_cost_array, reward_risk_array, reward_uti_array
 
-    def train(self, episodes: int = 500_000, seed: Optional[int] = None) -> None:
+    def train(self, training_steps: int = 25_000_000, seed: Optional[int] = None) -> None:
         """
         Trains the MODCMAC agent for `episodes` amount of episodes.
 
@@ -427,73 +453,52 @@ class MODCMACBase:
         - `Vnet_{name}.pt` for the value network.
         """
 
-        total_ep_cost = np.zeros(episodes + 1)  # episode cost (life-cycle cost)
-        total_manpower = np.zeros(episodes + 1)
-        start_time = time()
         if self.log_run:
             self.init_wandb()
-        columns = ["episode", "timestep", "accrued_cost", "accrued_risk"]
-        for i in range(self.ncomp):
-            columns.append(f"comp_{i + 1}_state")
-        for i in range(self.ncomp):
-            for j in range(self.nstcomp):
-                columns.append(f"comp_{i + 1}_state_{j + 1}_belief")
-        for i in range(self.ncomp):
-            columns.append(f"comp_{i + 1}_action")
-        columns.append("global_action")
 
-        for ep in range(0, episodes + 1):
+        curr_ep = 0
+        start_time = time()
+        while self.total_steps < training_steps:
             i = 0
+
             if seed is not None:
                 seed += 1
-                belief = self.env.reset(seed=seed)
+                observation, _ = self.env.reset(seed=seed)
             else:
-                belief = self.env.reset()
-            belief = torch.tensor(belief).float()
-            i_torch = torch.tensor(i / self.ep_length).float().view(1, 1)
+                observation, _ = self.env.reset()
+            curr_ep += 1
+            observation = torch.tensor(observation).float()
 
-            if self.use_accrued_reward:
-                observation = torch.cat([belief.view(belief.size(0), -1),
-                                         i_torch,
-                                         torch.zeros((1, self.n_objectives))],
-                                        dim=1)
-            else:
-                observation = torch.cat([belief.view(belief.size(0), -1), i_torch], dim=1)
-            total_ep_cost[ep] = 0  # initialize episode cost (life-cycle cost)
+            observation = self.create_input(observation, torch.zeros((1, self.n_objectives)))
+
             done = False
-            total_cost = np.zeros(self.n_objectives)
-            total_cost_discounted = np.zeros(self.n_objectives)
-            total_cost_money_discounted = 0
-            total_cost_manpower_discounted = 0
-            while not done:
-                action, behavior_ac_comp, behavior_ac_glob = self.select_action(observation,
-                                                                                training=True)  # select action
-                next_belief, cost, done, trunc, info = self.env.step(action)
-                gamma = torch.tensor([self.gamma ** i])
-                cost_inc = cost[0]
-                manpower = cost[1]
-                total_cost_discounted += (self.gamma ** i) * cost
-                total_cost_money_discounted += (self.gamma ** i) * cost[0]
-                total_cost_manpower_discounted += (self.gamma ** i) * cost[1]
-                total_cost += cost
-                cost = torch.tensor(cost, dtype=torch.float32).unsqueeze(0)
-                if i == 0:
-                    self.accrued = torch.cat((self.accrued[:-1], torch.zeros_like(cost), cost), dim=0)
-                else:
-                    self.accrued = torch.cat((self.accrued, self.accrued[-1] + gamma * cost), dim=0)
+            total_reward = np.zeros(self.n_objectives)
+            total_reward_discounted = np.zeros(self.n_objectives)
 
-                next_observation = self.create_input(torch.tensor(next_belief).float(), i + 1, self.accrued)
-                total_ep_cost[ep] += cost_inc  # cumulative cost up to time i
-                total_manpower[ep] += manpower
-                if i == self.ep_length - 1:
-                    done = True
-                transition = Transition(belief=observation,
-                                        belief_next=next_observation,
-                                        # time=torch.tensor(i / self.ep_length).float().view(1, 1),
+            while not done:
+                action = self.select_action(observation, training=True)  # select action
+                next_observation, reward, done, trunc, info = self.env.step(action.detach().numpy())
+                done = done or trunc
+                gamma = torch.tensor([self.gamma ** i])
+                total_reward_discounted += (self.gamma ** i) * reward
+                total_reward += reward
+                reward = torch.tensor(reward, dtype=torch.float32)
+                reward = reward.view(1, self.n_objectives)
+                # print(reward.shape)
+
+                if i == 0:
+                    self.accrued = torch.cat((self.accrued[:-1], torch.zeros_like(reward), reward), dim=0)
+                else:
+                    self.accrued = torch.cat((self.accrued, self.accrued[-1] + gamma * reward), dim=0)
+
+                next_observation = self.create_input(torch.tensor(next_observation).float(), self.accrued)
+
+                # if i == self.ep_length - 1:
+                #     done = True
+                transition = Transition(observation=observation,
+                                        next_observation=next_observation,
                                         action=action.unsqueeze(0),
-                                        behavior_ac_comp=behavior_ac_comp,
-                                        behavior_ac_glob=behavior_ac_glob,
-                                        reward=cost,
+                                        reward=reward,
                                         terminal=torch.tensor(done).view(1, 1),
                                         gamma=gamma)
 
@@ -501,128 +506,106 @@ class MODCMACBase:
 
                 observation = next_observation  # set initial observations for next step
                 if (self.total_steps + 1) % self.n_step_update == 0:
+                    with torch.no_grad():
+                        next_value = self.Vnet(observation)
                     loss_p, loss_v, entropy, update_loss = self.learn()
-                    if self.log_run:
-                        wandb.log({
-                            f"losses_{self.name}/policy": loss_p,
-                            f"losses_{self.name}/value": loss_v,
-                            f"losses_{self.name}/entropy": entropy,
-                            f"global_step": self.total_steps,
-                        })
+                    self.log.add_losses(loss_p, loss_v, entropy)
                 i += 1
                 self.total_steps += 1
+                # print(curr_step)
+                if self.total_steps % 5000 == 0:
+                    curr_run_time = time() - start_time
+                    run_time_per_ep = curr_run_time / self.total_steps
+                    eta = run_time_per_ep * (training_steps - self.total_steps)
+                    eta_min = eta / 60
+                    eta_hour = eta_min / 60
+                    print(f'Step {self.total_steps}/{training_steps} | '
+                          f'Run time: {curr_run_time:.2f}s | '
+                          f'ETA seconds: {eta:.2f}s | '
+                          f'ETA minutes: {eta_min:.2f}min | '
+                          f'ETA hours: {eta_hour:.2f}h | '
+                          f'Current Episode {curr_ep}', file=sys.stderr)
+                if self.log_run and self.total_steps % self.update_wandb_step == 0 and self.log.can_print:
+                    curr_wandb_policy_loss, curr_wandb_value_loss, curr_wandb_entropy = self.log.get_loss()
+                    (curr_wandb_episode_utility, curr_wandb_episode_discounted_utility, curr_wandb_episode_reward,
+                     curr_wandb_episode_discounted_reward) = self.log.get_episode()
+                    wandb_dict = {
+                        f"losses/policy": curr_wandb_policy_loss,
+                        f"losses/value": curr_wandb_value_loss,
+                        f"losses/entropy": curr_wandb_entropy,
+                        f"training/Utility": curr_wandb_episode_utility,
+                        f"training_discounted/Utility": curr_wandb_episode_discounted_utility,
+                        f"learning_rate/actor": self.optim.param_groups[0]["lr"],
+                        f"learning_rate/critic": self.optim.param_groups[1]["lr"],
+                    }
+                    for s in range(self.n_objectives):
+                        wandb_dict[f"training/{self.obj_names[s]}"] = curr_wandb_episode_reward[s]
+                        wandb_dict[f"training_discounted/{self.obj_names[s]}"] = (
+                            curr_wandb_episode_discounted_reward[s])
+                    wandb.log(wandb_dict, step=self.total_steps)
 
-            if (ep + 1) % 100 == 0:
-                curr_run_time = time() - start_time
-                run_time_per_ep = curr_run_time / (ep + 1)
-                eta = run_time_per_ep * (episodes - ep)
-                eta_min = eta / 60
-                eta_hour = eta_min / 60
-                print(f'Episode {ep + 1}/{episodes} | '
-                      f'Run time: {curr_run_time:.2f}s | '
-                      f'ETA seconds: {eta:.2f}s | '
-                      f'ETA minutes: {eta_min:.2f}min | '
-                      f'ETA hours: {eta_hour:.2f}h', file=sys.stderr)
-
-            if (ep + 1) % self.do_eval_every == 0:
-                reward_cost_array = np.zeros(self.n_eval)
-                reward_risk_array = np.zeros(self.n_eval)
+            if (curr_ep + 1) % self.do_eval_every == 0:
+                reward_array = np.zeros((self.n_eval, self.n_objectives))
                 reward_uti_array = np.zeros(self.n_eval)
-                reward_len_array = np.zeros(self.n_eval)
                 """
                 Evaluates the policy on the environment for n_eval episodes (n_eval is a parameter of the class)
                 """
-                for i in range(self.n_eval):
+                for ne in range(self.n_eval):
                     reward, n, has_failed, _ = self.evaluate()
-                    total_cost_eval_curr = np.abs(reward[0])
-                    total_prob_eval_curr = 1 - np.exp(reward[1])
-                    eval_cost_curr = np.abs(self.utility(torch.tensor(reward).view(1, self.n_objectives)).item())
-                    reward_cost_array[i] = total_cost_eval_curr
-                    reward_risk_array[i] = total_prob_eval_curr
-                    reward_uti_array[i] = eval_cost_curr
-                    reward_len_array[i] = n
-                cost_mean = np.mean(reward_cost_array)
-                risk_mean = np.mean(reward_risk_array)
+                    eval_cost_curr = self.utility(torch.tensor(reward).view(1, self.n_objectives)).item()
+                    reward_array[ne] = reward
+                    reward_uti_array[ne] = eval_cost_curr
+
                 utility_mean = np.mean(reward_uti_array)
-                length_mean = np.mean(reward_len_array)
-                cost_std = np.std(reward_cost_array)
-                risk_std = np.std(reward_risk_array)
                 utility_std = np.std(reward_uti_array)
-                length_std = np.std(reward_len_array)
                 if self.log_run:
-                    wandb.log({
-                        f"evaluation_{self.name}/Utility": utility_mean,
-                        f"evaluation_{self.name}/Utility_std": utility_std,
-                        f"evaluation_{self.name}/Cost": cost_mean,
-                        f"evaluation_{self.name}/Cost_std": cost_std,
-                        f"evaluation_{self.name}/Risk": risk_mean,
-                        f"evaluation_{self.name}/Risk_std": risk_std,
-                        f"global_step": self.total_steps,
-                    })
+                    wandb_dict = {
+                        f"evaluation/Utility": utility_mean,
+                        f"evaluation/Utility_std": utility_std,
+
+                    }
+                    for n_o in range(self.n_objectives):
+                        wandb_dict[f"evaluation/{self.obj_names[n_o]}"] = np.mean(reward_array[:, n_o])
+                        wandb_dict[f"evaluation/{self.obj_names[n_o]}_std"] = np.std(reward_array[:, n_o])
+                    wandb.log(wandb_dict, step=self.total_steps)
 
                 print("\n----------------------------------------------------------")
-                print(f"The evaluation at episode {ep + 1} returned:\n"
-                      f"Utility: {np.round(utility_mean, 3)} SD={np.round(utility_std, 3)}\n"
-                      f"Cost: {np.round(cost_mean, 3)} SD={np.round(cost_std, 3)}\n"
-                      f"Risk: {np.round(risk_mean, 3)} SD={np.round(risk_std, 3)}\n"
-                      f"Length: {np.round(length_mean, 3)} SD={np.round(length_std, 3)}")
+                print_mes = (f"The evaluation at step {self.total_steps} returned:\n" +
+                             f"Utility: {np.round(utility_mean, 3)} SD={np.round(utility_std, 3)}\n")
+                for n_o in range(self.n_objectives):
+                    print_mes += f"{self.obj_names[n_o]}: {np.round(np.mean(reward_array[:, n_o]), 3)} SD={np.round(np.std(reward_array[:, n_o]), 3)}\n"
+                print(print_mes)
                 print("----------------------------------------------------------\n")
-                # self.save_model()
-            if (ep + 1) % 100_000 == 0:
-                self.save_model(name="ep_" + str(ep + 1))
+                self.save_model()
+            if (self.total_steps + 1) % 1_000_000 == 0:
+                self.save_model(name="curr_step_" + str(self.total_steps + 1))
 
-            curr_total_uti = self.utility(torch.tensor(total_cost).view(1, self.n_objectives))
-            curr_total_prob = 1 - np.exp(total_manpower[ep])
-            curr_total_uti_discounted = self.utility(torch.tensor(total_cost_discounted).view(1, self.n_objectives))
-            curr_total_cost_discounted = np.abs(total_cost_money_discounted)
-            curr_total_risk_discounted = 1 - np.exp(total_cost_manpower_discounted)
-            if self.log_run:
-                wandb.log({
-                    f"training_{self.name}/Cost": np.abs(total_ep_cost[ep]),
-                    f"training_{self.name}/Collapse_prob": curr_total_prob,
-                    f"training_{self.name}/Utility": np.abs(curr_total_uti),
-                    f"training_discounted_{self.name}/Utility": np.abs(curr_total_uti_discounted),
-                    f"training_discounted_{self.name}/Cost": curr_total_cost_discounted,
-                    f"training_discounted_{self.name}/Collapse_prob": curr_total_risk_discounted,
-                    f"learning_rate_{self.name}/actor": self.optim.param_groups[0]["lr"],
-                    f"learning_rate_{self.name}/critic": self.optim.param_groups[1]["lr"],
-                    f"global_step": self.total_steps,
-                })
+            curr_total_uti = self.utility(torch.tensor(total_reward).view(1, self.n_objectives))
+            curr_total_uti_discounted = self.utility(torch.tensor(total_reward_discounted).view(1, self.n_objectives))
+            self.log.add_episode(curr_total_uti.item(), curr_total_uti_discounted.item(), total_reward,
+                                 total_reward_discounted)
 
-            if self.use_lr_scheduler:
-                self.lr_scheduler.step()
-
-        reward_cost_array = np.zeros(self.n_eval)
-        reward_risk_array = np.zeros(self.n_eval)
+        reward_array = np.zeros((self.n_eval, self.n_objectives))
         reward_uti_array = np.zeros(self.n_eval)
-        reward_len_array = np.zeros(self.n_eval)
 
-        for i in range(self.n_eval):
-            reward, n, has_failed, _ = self.evaluate()
-            total_cost_eval_curr = np.abs(reward[0])
-            total_prob_eval_curr = 1 - np.exp(reward[1])
-            eval_cost_curr = np.abs(self.utility(torch.tensor(reward).view(1, self.n_objectives)).item())
-            reward_cost_array[i] = total_cost_eval_curr
-            reward_risk_array[i] = total_prob_eval_curr
-            reward_uti_array[i] = eval_cost_curr
-            reward_len_array[i] = n
-        cost_mean = np.mean(reward_cost_array)
-        risk_mean = np.mean(reward_risk_array)
+        for ne in range(self.n_eval):
+            reward, _, has_failed, _ = self.evaluate()
+            eval_uti_curr = np.abs(self.utility(torch.tensor(reward).view(1, self.n_objectives)).item())
+            reward_uti_array[ne] = eval_uti_curr
+            reward_array[ne] = reward
+
         utility_mean = np.mean(reward_uti_array)
-        cost_std = np.std(reward_cost_array)
-        risk_std = np.std(reward_risk_array)
         utility_std = np.std(reward_uti_array)
 
         if self.log_run:
-            wandb.log({
-                f"evaluation_{self.name}/Utility": utility_mean,
-                f"evaluation_{self.name}/Utility_std": utility_std,
-                f"evaluation_{self.name}/Cost": cost_mean,
-                f"evaluation_{self.name}/Cost_std": cost_std,
-                f"evaluation_{self.name}/Risk": risk_mean,
-                f"evaluation_{self.name}/Risk_std": risk_std,
-                f"global_step": self.total_steps,
-            })
+            wand_dict = {
+                f"evaluation/Utility": utility_mean,
+                f"evaluation/Utility_std": utility_std,
+            }
+            for n_o in range(self.n_objectives):
+                wand_dict[f"evaluation/{self.obj_names[n_o]}"] = np.mean(reward_array[:, n_o])
+                wand_dict[f"evaluation/{self.obj_names[n_o]}_std"] = np.std(reward_array[:, n_o])
+            wandb.log(wand_dict, step=self.total_steps)
 
         self.save_model("final")
         self.close_wandb()
@@ -642,5 +625,125 @@ class MODCMACBase:
         self.Pnet.load_state_dict(torch.load(path_pnet))
         self.Vnet.load_state_dict(torch.load(path_vnet))
 
-    def learn(self) -> Tuple[float, float, float, int]:
+    def learn_critic(self, batch: BatchTransition) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError
+
+    def learn_policy_discrete_old(self, advantage: torch.Tensor, batch: BatchTransition) \
+            -> Tuple[torch.Tensor, torch.Tensor]:
+        pi_ac = self.Pnet(batch.belief)
+        pi_ac = pi_ac.softmax(dim=2)
+        n_heads = pi_ac.shape[0]
+        ind = range(self.n_step_update)
+        pi_aa = torch.zeros((n_heads, self.n_step_update), device=self.device)
+        mu_aa = torch.zeros((n_heads, self.n_step_update), device=self.device)
+        for k in range(n_heads):
+            pi_aa[k] = pi_ac[k][ind, batch.action[:,
+                                     k]].detach()  # target (current) probability of action retrieved from replay buffer for each component
+            mu_aa[k] = batch.behavior_ac[ind, k, list(batch.action[:,
+                                                      k])].detach()  # sampled (original) probability of action retrieved from replay buffer for each component
+
+        rho = torch.prod(pi_aa / mu_aa, dim=0)  # joint importance weight
+        rho = torch.minimum(rho, 2 * torch.ones(self.n_step_update, device=self.device))  # clip importance weight
+
+        advantage = torch.mul(advantage, rho)  # weighted advantage
+        log_prob = torch.zeros((n_heads, self.n_step_update), device=self.device)
+
+        entropy = torch.zeros(self.n_step_update, dtype=torch.float)
+        for j in range(n_heads):
+            dist = Categorical(probs=pi_ac[j])
+            log_prob[j] = -dist.log_prob(batch.action[:, j])
+            entropy += dist.entropy()
+
+        actor_loss = torch.sum(log_prob, dim=0) * advantage.detach()
+        return actor_loss, entropy
+
+    def learn_policy_discrete(self, advantage: torch.Tensor, batch) -> Tuple[torch.Tensor, torch.Tensor]:
+        pi_ac = self.Pnet(batch.observation)
+        pi_ac_probs = pi_ac.softmax(dim=2)
+
+        # Shape: (n_heads, n_step_update)
+        dist = Categorical(probs=pi_ac_probs)
+
+        log_prob = -dist.log_prob(batch.action.t()).t()
+
+        # Shape: (n_step_update,)
+        entropy = torch.sum(dist.entropy(), dim=0)
+
+        # Shape: (n_step_update,)
+        actor_loss = torch.sum(log_prob, dim=1) * advantage.detach()
+
+        return actor_loss, entropy
+
+    def learn_policy(self, advantage: torch.Tensor, batch) -> Tuple[torch.Tensor, torch.Tensor]:
+        pi_ac = self.Pnet(batch.observation)
+
+        # Shape: (n_heads, n_step_update)
+        dist = self.distribution(logits=pi_ac)
+
+        log_prob = -dist.log_prob(batch.action)
+
+        # Shape: (n_step_update,)
+        entropy = dist.entropy()
+
+        # Shape: (n_step_update,)
+        actor_loss = log_prob * advantage.detach()
+
+        return actor_loss, entropy
+
+    def learn_policy_continuous(self, advantage: torch.Tensor, batch) -> Tuple[torch.Tensor, torch.Tensor]:
+        pi_ac = self.Pnet(batch.observation)
+        mu, var = pi_ac[:, :, 0], pi_ac[:, :, 1]
+        # log_std = torch.log(var)
+        # Shape: (n_heads, n_step_update)
+        dist = Normal(mu, var)
+        log_prob = -dist.log_prob(batch.action.t()).t()
+
+        # Shape: (n_step_update,)
+        entropy = torch.sum(dist.entropy(), dim=0)
+        # print(entropy)
+        # exit()
+        # entropy = (-(torch.log(2 * torch.pi * var) + 1) / 2).mean(dim=0)
+        # # print(entropy.shape)
+        # exit()
+
+        # Shape: (n_step_update,)
+        actor_loss = torch.sum(log_prob, dim=1) * advantage.detach()
+
+        return actor_loss, entropy
+
+    def learn(self) -> Tuple[float, float, float, int]:
+        """
+        Performs a learning step for the policy network (Pnet) and value network (Vnet).
+
+        Returns:
+        --------
+        loss_p : float
+            The loss of the policy network.
+        loss_v : float
+            The loss of the value network.
+        entropy : float
+            The entropy of the policy network.
+        update_loss : int
+            The number of updates performed NOTE: This is legacy code and should be removed.
+        """
+        batch = self.buffer.last(self.n_step_update)
+        critic_loss, advantage = self.learn_critic(batch)
+        if self.normalize_advantage:
+            advantage = (advantage - advantage.mean()) / (advantage.std() + 1e-8)
+        actor_loss, entropy = self.learn_policy(advantage, batch)
+
+        loss = actor_loss + self.v_coef * critic_loss - self.e_coef * entropy
+        self.optim.zero_grad()
+        loss = loss.mean()
+        loss.backward()
+
+        if self.clip_grad_norm is not None:
+            nn.utils.clip_grad_norm_(self.Pnet.parameters(), self.clip_grad_norm)
+            nn.utils.clip_grad_norm_(self.Vnet.parameters(), self.clip_grad_norm)
+
+        self.optim.step()
+        if self.use_lr_scheduler:
+            self.lr_scheduler.step()
+        self.accrued = self.accrued[-1:]
+
+        return actor_loss.mean().item(), critic_loss.mean().item(), entropy.mean().item(), 1

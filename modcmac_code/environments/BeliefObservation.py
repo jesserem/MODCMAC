@@ -19,12 +19,16 @@ class BayesianObservation(gym.Wrapper):
 
     """
 
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env, episode_length: int = 50):
         super().__init__(env)
-        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(1, self.ncomp, self.nstcomp, 1))
+        belief_obs = self.ncomp * self.nstcomp + 1
+        self.observation_space = gym.spaces.Box(low=0, high=1, shape=(belief_obs,))
         self.belief = None
+        self.timestep = 0
+        self.episode_length = episode_length
 
-    def reset(self, options: Optional[Dict[str, Any]] = None, seed: Optional[int] = None, **kwargs) -> np.ndarray:
+    def reset(self, options: Optional[Dict[str, Any]] = None, seed: Optional[int] = None, **kwargs) \
+            -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         The reset function is overwritten to reset the belief state.
 
@@ -37,14 +41,30 @@ class BayesianObservation(gym.Wrapper):
 
         Returns
         -------
-        self.belief: numpy array
-            The initial belief state of the environment.
+        observation: numpy array
+            The initial observation of the environment with the timestep.
+        info: dict
+            Dictionary containing additional information. For debugging.
         """
         super().reset(seed=seed, options=options)
         self.belief = np.zeros((1, self.ncomp, self.nstcomp, 1))
+        self.timestep = 0
         for i in range(self.ncomp):
             self.belief[0, i, :, 0] = np.array([0.25, 0.25, 0.25, 0.2, 0.05])
-        return self.belief
+        return self.create_observation(), {}
+
+    def create_observation(self) -> np.ndarray:
+        """
+        Creates the observation of the environment by flattening the belief state and adding the timestep.
+
+        Returns:
+        -------
+        observation: numpy array
+            The observation of the environment.
+        """
+        observation = self.belief.flatten()
+        observation = np.append(observation, self.timestep / self.episode_length)
+        return observation
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, bool, bool, Dict[str, Any]]:
         """
@@ -70,8 +90,9 @@ class BayesianObservation(gym.Wrapper):
         """
         obs_state, reward, terminated, truncated, info = self.env.step(action)
         action_rep, action_in = self.get_action(action)
+        self.timestep += 1
         self.belief = self.belief_update(self.belief, action_in, action_rep, obs_state)
-        return self.belief, reward, terminated, truncated, info
+        return self.create_observation(), reward, terminated, truncated, info
 
     def get_observation_matrix(self, a_in, a_rep):
         o = self.O[a_in]
@@ -109,6 +130,7 @@ class BayesianObservation(gym.Wrapper):
         for i in range(self.ncomp):
             curr_det_rate = det_rate[i] - 1
             comp_type = self.comp_setup[i]
+            # print("b_prime before", b_prime[0, i, :, 0])
 
             if a_rep[i] == 1:  # if action 1 is taken, component is sent to previous damage state
                 b = np.append(b_prime[0, i, :, 0], np.zeros(1))
@@ -122,6 +144,14 @@ class BayesianObservation(gym.Wrapper):
                 o[i] = 0
 
             ob_matrix = self.get_observation_matrix(a_in, a_rep[i])
+            # print("ob[i]", o[i])
+            # print("a_in", a_in)
+            # print("a_rep[i]", a_rep[i])
             p1 = self.P[curr_det_rate, comp_type].T.dot(b_prime[0, i, :, 0])  # environment transition
+            # print("p1", p1)
+            # print("ob_matrix", ob_matrix[:, int(o[i])])
+            # print("p1.dot(ob_matrix[:, int(o[i])])", p1.dot(ob_matrix[:, int(o[i])]))
             b_prime[0, i, :, 0] = p1 * ob_matrix[:, int(o[i])] / (p1.dot(ob_matrix[:, int(o[i])]))  # belief update
+            # print("b_prime after", b_prime[0, i, :, 0])
+            # print("\n")
         return b_prime
