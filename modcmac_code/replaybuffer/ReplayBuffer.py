@@ -191,6 +191,8 @@ class BatchTransition(object):
     def __init__(self, observation: torch.Tensor, next_observation: torch.Tensor, action: torch.Tensor,
                  cost: torch.Tensor, terminal: torch.Tensor, gamma: torch.Tensor = torch.tensor([1.]),
                  device: Union[str, torch.device] = 'cpu'):
+        # print(gamma.shape)
+        # exit()
 
         if len(action.shape) == 1:
             action = action[:, None]
@@ -282,8 +284,9 @@ class Memory(object):
             batch = self.memory[s_i:] + self.memory[:e_i]
         else:
             batch = self.memory[s_i:e_i]
-
+        # print(self.memory[0][5].shape)
         batch = BatchTransition(*[torch.cat(i) for i in zip(*batch)], device=self.device)
+        # print(batch.gamma.shape)
         return batch
 
 

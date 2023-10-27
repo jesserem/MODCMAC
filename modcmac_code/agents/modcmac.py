@@ -186,7 +186,9 @@ class MODCMAC(MODCMACBase):
     def calculate_advantage(self, p_s: torch.Tensor, p_ns: torch.Tensor, returns: torch.Tensor, batch) -> torch.Tensor:
         objective_dims = tuple(range(1, len(p_s.shape)))
         accrued = self.accrued[:-1].view(len(returns), *(1,) * self.n_objectives, self.n_objectives).to(self.device)
-        gamma = batch.gamma.view(len(returns), *(1,) * (self.n_objectives + 1))
+
+        gamma = batch.gamma.view(len(returns), *(1,) * (self.n_objectives), batch.gamma.shape[1])
+        # print(gamma)
         # shift back discounted return: accrued + gamma^t*R_t
         accrued_v = accrued + gamma * self.r_z
         u_v_s = self.utility(accrued_v.view(-1, self.n_objectives)).view_as(p_s)
@@ -215,6 +217,10 @@ class MODCMAC(MODCMACBase):
             returns = batch.reward.unsqueeze(1).expand(s_[0], self.c, s_[1]).clone()
 
             # [C51 nO] + gamma*[C51 nO]*[1 1] -> [C51 nO]
+            # print(self.gamma.shape)
+            # print(self.z.shape)
+            # print(returns[-1].shape)
+            # exit()
             returns[-1] += self.gamma * self.z * non_terminal[-1]
 
             for i in range(len(returns) - 1, 0, -1):

@@ -100,7 +100,8 @@ def main():
                     v_min=(args.v_min_cost, args.v_min_risk), v_max=(args.v_max_cost, args.v_max_risk),
                     clip_grad_norm=clip_grad_norm, c=args.c, device=args.device, n_step_update=args.n_step_update,
                     v_coef=args.v_coef, e_coef=args.e_coef, lr_critic=args.lr_critic, do_eval_every=1000,
-                    lr_policy=args.lr_policy, use_accrued_reward=args.no_accrued_reward, gamma=args.gamma,
+                    lr_policy=args.lr_policy, use_accrued_reward=args.no_accrued_reward,
+                    gamma=torch.tensor([args.gamma, args.gamma]),
                     save_folder=args.save_folder, name=args.name, num_steps=args.num_steps, eval_only=args.do_eval,
                     project_name="modcmac_quay_wall")
 

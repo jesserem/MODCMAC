@@ -26,8 +26,8 @@ class Log(object):
         self.wandb_entropy = 0
         self.wandb_episode_utility = 0
         self.wandb_episode_discounted_utility = 0
-        self.wandb_episode_reward = np.zeros(self.n_objectives)
-        self.wandb_episode_discounted_reward = np.zeros(self.n_objectives)
+        self.wandb_episode_reward = torch.zeros(self.n_objectives)
+        self.wandb_episode_discounted_reward = torch.zeros(self.n_objectives)
 
     def add_losses(self, policy_loss: float, value_loss: float, entropy: float):
         self.wandb_policy_loss += policy_loss
@@ -35,7 +35,8 @@ class Log(object):
         self.wandb_entropy += entropy
         self.n_update += 1
 
-    def add_episode(self, utility: float, discounted_utility: float, reward: np.ndarray, discounted_reward: np.ndarray):
+    def add_episode(self, utility: float, discounted_utility: float, reward: torch.Tensor,
+                    discounted_reward: torch.Tensor):
         self.wandb_episode_utility += utility
         self.wandb_episode_discounted_utility += discounted_utility
         self.wandb_episode_reward += reward
@@ -59,8 +60,8 @@ class Log(object):
         discounted_reward = self.wandb_episode_discounted_reward / self.n_episodes
         self.wandb_episode_utility = 0
         self.wandb_episode_discounted_utility = 0
-        self.wandb_episode_reward = np.zeros(self.n_objectives)
-        self.wandb_episode_discounted_reward = np.zeros(self.n_objectives)
+        self.wandb_episode_reward = torch.zeros(self.n_objectives)
+        self.wandb_episode_discounted_reward = torch.zeros(self.n_objectives)
         self.n_episodes = 0
         return utility, discounted_utility, reward, discounted_reward
 
@@ -388,7 +389,7 @@ class MODCMACBase:
             next_observation, reward, done, trunc, info = self.env.step(action.detach().numpy())
             done = done or trunc
             total_reward += reward
-            gamma = torch.tensor([self.gamma ** i])
+            gamma = torch.pow(self.gamma, torch.tensor(i).float())
             reward_tensor = torch.tensor(reward).float().view(1, self.n_objectives)
             if i == 0:
                 accrued = torch.cat((accrued[:-1], torch.zeros_like(reward_tensor), reward_tensor), dim=0)
@@ -472,19 +473,20 @@ class MODCMACBase:
             observation = self.create_input(observation, torch.zeros((1, self.n_objectives)))
 
             done = False
-            total_reward = np.zeros(self.n_objectives)
-            total_reward_discounted = np.zeros(self.n_objectives)
+            total_reward = torch.zeros(self.n_objectives)
+            total_reward_discounted = torch.zeros(self.n_objectives)
 
             while not done:
                 action = self.select_action(observation, training=True)  # select action
                 next_observation, reward, done, trunc, info = self.env.step(action.detach().numpy())
                 done = done or trunc
-                gamma = torch.tensor([self.gamma ** i])
-                total_reward_discounted += (self.gamma ** i) * reward
-                total_reward += reward
+                gamma = torch.pow(self.gamma, torch.tensor(i).float())
+
                 reward = torch.tensor(reward, dtype=torch.float32)
+
+                total_reward_discounted += reward * (self.gamma ** i)
+                total_reward += reward
                 reward = reward.view(1, self.n_objectives)
-                # print(reward.shape)
 
                 if i == 0:
                     self.accrued = torch.cat((self.accrued[:-1], torch.zeros_like(reward), reward), dim=0)
@@ -493,14 +495,12 @@ class MODCMACBase:
 
                 next_observation = self.create_input(torch.tensor(next_observation).float(), self.accrued)
 
-                # if i == self.ep_length - 1:
-                #     done = True
                 transition = Transition(observation=observation,
                                         next_observation=next_observation,
                                         action=action.unsqueeze(0),
                                         reward=reward,
                                         terminal=torch.tensor(done).view(1, 1),
-                                        gamma=gamma)
+                                        gamma=gamma.unsqueeze(0))
 
                 self.buffer.add(transition)
 
@@ -590,7 +590,7 @@ class MODCMACBase:
 
         for ne in range(self.n_eval):
             reward, _, has_failed, _ = self.evaluate()
-            eval_uti_curr = np.abs(self.utility(torch.tensor(reward).view(1, self.n_objectives)).item())
+            eval_uti_curr = self.utility(torch.tensor(reward).view(1, self.n_objectives)).item()
             reward_uti_array[ne] = eval_uti_curr
             reward_array[ne] = reward
 
