@@ -1,10 +1,13 @@
 import gymnasium as gym
 from gymnasium.spaces import MultiDiscrete, Box
+from gymnasium.utils import EzPickle
 import numpy as np
+from .scenario import Scenario
+import pandas as pd
 from typing import Tuple, Optional, Dict, Any
 
 
-class MaintenanceEnv(gym.Env):
+class MaintenanceEnv(gym.Env, EzPickle):
     """
     The MaintenanceEnv class is the environment for the maintenance problem. The environment uses a discrete action
     and observation space. The action space is a MultiDiscrete space, where the first ncomp actions are the component
@@ -58,13 +61,18 @@ class MaintenanceEnv(gym.Env):
 
     def __init__(self, ncomp: int, ndeterioration: int, ntypes: int, nstcomp: int, naglobal: int, nacomp: int,
                  nobs: int, nfail: int, P: np.ndarray, O: np.ndarray, C_glo: np.ndarray, C_rep: np.ndarray,
-                 comp_setup: np.ndarray, f_modes: np.ndarray, start_S: np.ndarray, total_cost: float):
+                 comp_setup: np.ndarray, f_modes: Tuple, f_modes_probs: Tuple, start_S: np.ndarray,
+                 total_cost: float, ep_length: int, render_mode: Optional[str] = None):
+        EzPickle.__init__(self, render_mode=render_mode)
+        self.render_mode = render_mode
+        self.f_modes_probs = f_modes_probs
         self.ncomp = ncomp
         self.start_S = start_S
         self.ndeterioration = ndeterioration
         self.ntypes = ntypes
         self.nstcomp = nstcomp
         self.total_cost = total_cost
+        self.ep_length = ep_length
 
         self.nacomp = nacomp
         self.naglobal = naglobal
@@ -82,10 +90,15 @@ class MaintenanceEnv(gym.Env):
         self.action_space = MultiDiscrete([self.nacomp] * self.ncomp + [self.naglobal])
         self.observation_space = MultiDiscrete(
             np.array([[self.nstcomp] * self.ncomp, [self.ndeterioration] * self.ncomp]))
-        self.reward_space = Box(np.array([-225000, -5]), np.array([0, 0]))
+        self.reward_space = Box(np.array([-1.0, -25.0]), np.array([0.0, 0.0]), dtype=np.float64)
 
         self.state = np.zeros((self.ncomp, self.nstcomp))
         self.det_rate = np.zeros((self.ncomp, 1), dtype=int)
+        self.scenario = None
+        self.curr_step = 0
+        self.action_taken = None
+        self.state_prev = None
+        self.obs_rec = None
 
     def get_action(self, action: np.ndarray) -> Tuple[np.ndarray, int]:
         """
@@ -106,7 +119,13 @@ class MaintenanceEnv(gym.Env):
         action_comp, action_glob = action[:-1], action[-1]
         return action_comp, action_glob
 
-    def reset(self, options: Optional[Dict[str, Any]] = None, seed: Optional[int] = None, **kwargs) -> None:
+    def add_state_action(self, action: np.ndarray, state: np.ndarray, obs: np.ndarray) -> None:
+        self.action_taken[self.curr_step] = np.copy(action)
+        self.state_prev[self.curr_step] = np.copy(state)
+        self.obs_rec[self.curr_step] = np.copy(obs)
+
+    def reset(self, scenario: Optional[Scenario] = None, options: Optional[Dict[str, Any]] = None,
+              seed: Optional[int] = None, **kwargs) -> Tuple[np.ndarray, Dict[str, Any]]:
         """
         Resets the environment. The state is set to the initial state and the deterioration rate is set to 0.
 
@@ -120,10 +139,29 @@ class MaintenanceEnv(gym.Env):
             Additional arguments
 
         """
-        super().reset(seed=seed)
-        self.state = np.copy(self.start_S)
-        self.det_rate = np.zeros((self.ncomp, 1), dtype=int)
-        return None
+        super().reset(seed=seed, options=options)
+        self.scenario = scenario
+        if self.scenario is not None:
+            if self.scenario.transitions.shape[0] != self.ncomp:
+                raise ValueError("Scenario file does not have the correct number of components")
+            if self.scenario.initial_state.max() >= self.nstcomp:
+                raise ValueError("Scenario file has an initial state that is not possible")
+            start_state = np.zeros((self.ncomp, self.nstcomp), dtype=int)
+            for i in range(self.ncomp):
+                start_state[i, self.scenario.initial_state[i]] = 1
+            self.state = np.copy(start_state)
+            self.det_rate = np.copy(self.scenario.det_rate)
+        else:
+            self.state = np.copy(self.start_S)
+            self.det_rate = np.zeros((self.ncomp, 1), dtype=int)
+        self.curr_step = 0
+        self.action_taken = np.zeros((self.ep_length + 1, self.ncomp + 1), dtype=int)
+        self.state_prev = np.zeros((self.ep_length + 1, self.ncomp, self.nstcomp), dtype=int)
+        self.obs_rec = np.zeros((self.ep_length + 1, 2, self.ncomp), dtype=int)
+        self.state_prev[self.curr_step] = np.copy(self.state)
+        start_obs = self.observation(self.state, 0, np.zeros(self.ncomp))
+        self.obs_rec[self.curr_step] = np.copy(start_obs)
+        return start_obs, {"state": self.state}
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, bool, bool, Dict[str, Any]]:
         """
@@ -166,7 +204,89 @@ class MaintenanceEnv(gym.Env):
         return_observation[1] = self.det_rate.T
 
         reward = np.array([cost, failure_cost])
-        return return_observation, reward, terminated, False, {"state": self.state}
+
+        self.curr_step += 1
+        self.add_state_action(action, self.state, return_observation)
+
+        done = self.curr_step >= self.ep_length
+        return return_observation, reward, terminated, done, {"state": self.state}
+
+    def get_episode(self) -> pd.DataFrame:
+        """
+        Returns the episode as a pandas DataFrame with the belief, the real state, the observations, and
+        the actions taken.
+        Returns:
+        -------
+        episode: pandas DataFrame
+            The episode as a pandas DataFrame.
+        -------
+        """
+        obs_rec = self.obs_rec
+        states = self.state_prev
+        actions = self.action_taken
+        df_dict = {"timestep": list(range(self.ep_length + 1))}
+        for i in range(self.ncomp):
+
+            df_dict[f"obs_comp_{i}"] = obs_rec[:, 0, i]
+            df_dict[f"obs_det_rate_comp_{i}"] = obs_rec[:, 1, i]
+            df_dict[f"action_comp_{i}"] = actions[:, i]
+            for j in range(self.nstcomp):
+                df_dict[f"state_comp_{i}_state_{j}"] = states[:, i, j]
+        df_dict["global_action"] = actions[:, self.ncomp]
+        # print(df_dict)
+        episode = pd.DataFrame(df_dict)
+        return episode
+
+    # def failure_mode(self, s: np.ndarray) -> float:
+    #     """
+    #     Calculates the failure probability of each of the components. The failure probability is calculated based on the
+    #     failure modes of the components. The failure modes are defined in the f_modes variable. The failure modes are
+    #     defined as follows (CURRENTLY EVENTS ARE INDEPENDENT, MIGHT BE DEPENDENT IN THE FUTURE):
+    #     F1: 1 component failed = 0.05
+    #         2 components failed = 0.1
+    #         3 components failed = 0.4
+    #     F2: 1 component failed = 0.02
+    #         2 components failed = 0.33
+    #     F3: 1 component failed = 0.05
+    #
+    #     Parameters:
+    #     ----------
+    #     s : np.ndarray
+    #         Current state of the environment
+    #
+    #     Returns:
+    #     -------
+    #     collapse_fail : float
+    #         Failure probability of the components of the current state
+    #     """
+    #     fail_state = (np.argmax(s, axis=1) == self.nstcomp - 1).astype(int)
+    #     fail_prob = 1
+    #     # FAIL MODE 1
+    #     for i in range(self.f_modes[0].shape[0]):
+    #         n_fail = np.sum(fail_state[self.f_modes[0][i, :]])
+    #
+    #         if n_fail == 1:
+    #             fail_prob *= (1 - 0.01)
+    #         elif n_fail == 2:
+    #             fail_prob *= (1 - 0.10)
+    #         elif n_fail == 3:
+    #             fail_prob *= (1 - 0.40)
+    #     # FAIL MODE 2
+    #     for i in range(self.f_modes[1].shape[0]):
+    #
+    #         n_fail = np.sum(fail_state[self.f_modes[1][i, :]])
+    #
+    #         if n_fail == 1:
+    #             fail_prob *= (1 - 0.03)
+    #         elif n_fail == 2:
+    #             fail_prob *= (1 - 0.33)
+    #     # FAIL MODE 3
+    #     for i in range(self.f_modes[2].shape[0]):
+    #         n_fail = np.sum(fail_state[self.f_modes[2][i, :]])
+    #         if n_fail == 1:
+    #             fail_prob *= (1 - 0.05)
+    #     collapse_fail = np.log(fail_prob)
+    #     return collapse_fail
 
     def failure_mode(self, s: np.ndarray) -> float:
         """
@@ -193,27 +313,12 @@ class MaintenanceEnv(gym.Env):
         fail_state = (np.argmax(s, axis=1) == self.nstcomp - 1).astype(int)
         fail_prob = 1
         # FAIL MODE 1
-        for i in range(self.f_modes[0].shape[0]):
-            n_fail = np.sum(fail_state[self.f_modes[0][i, :]])
-            if n_fail == 1:
-                fail_prob *= (1 - 0.01)
-            elif n_fail == 2:
-                fail_prob *= (1 - 0.10)
-            elif n_fail == 3:
-                fail_prob *= (1 - 0.40)
-        # FAIL MODE 2
-        for i in range(self.f_modes[1].shape[0]):
-            n_fail = np.sum(fail_state[self.f_modes[1][i, :]])
-            if n_fail == 1:
-                fail_prob *= (1 - 0.03)
-            elif n_fail == 2:
-                fail_prob *= (1 - 0.33)
-        # FAIL MODE 3
-        for i in range(self.f_modes[2].shape[0]):
-            n_fail = np.sum(fail_state[self.f_modes[2][i, :]])
-            if n_fail == 1:
-                fail_prob *= (1 - 0.05)
+        for f_mode, f_prob in zip(self.f_modes, self.f_modes_probs):
+            for i in range(f_mode.shape[0]):
+                n_fail = np.sum(fail_state[f_mode[i, :]])
+                fail_prob *= (1 - f_prob[n_fail])
         collapse_fail = np.log(fail_prob)
+
         return collapse_fail
 
     def state_prime(self, s: np.ndarray, a: np.ndarray) -> np.ndarray:
@@ -253,9 +358,12 @@ class MaintenanceEnv(gym.Env):
                 s_prime[i, :] = 0 * s_prime[i, :]
                 s_prime[i, 0] = 1
                 self.det_rate[i, 0] = 0
-
-            p_dist = self.P[self.det_rate[i, 0], self.comp_setup[i]].T.dot(s_prime[i, :])  # environment transition
-            s_pr_idx = np.random.choice(range(0, self.nstcomp), size=None, replace=True, p=p_dist)
+            if self.scenario:
+                s_curr_idx = np.argmax(s_prime[i, :])
+                s_pr_idx = np.minimum(s_curr_idx + self.scenario.transitions[i, self.curr_step], self.nstcomp - 1)
+            else:
+                p_dist = self.P[self.det_rate[i, 0], self.comp_setup[i]].T.dot(s_prime[i, :])  # environment transition
+                s_pr_idx = np.random.choice(range(0, self.nstcomp), size=None, replace=True, p=p_dist)
             s_prime[i, :] = 0 * s_prime[i, :]
             s_prime[i, s_pr_idx] = 1
 

@@ -1,5 +1,8 @@
 from modcmac_code.environments.Maintenance_Gym import MaintenanceEnv as maintenance_env
+from modcmac_code.environments.BeliefObservation import BayesianObservation
 import numpy as np
+import gymnasium as gym
+from modcmac_code.utils.utils import seed_everything
 
 
 def create_env():
@@ -174,7 +177,7 @@ def create_env():
 
     f_modes = (f_mode_1, f_mode_2, f_mode_3)
     test_env = maintenance_env(ncomp, ndeterioration, ntypes, nstcomp, naglobal, nacomp, nobs, nfail, P,
-                               O, C_glo, C_rep, comp_setup, f_modes, start_S, total_cost)
+                               O, C_glo, C_rep, comp_setup, f_modes, start_S, total_cost, ep_length=50)
     return test_env
 
 
@@ -188,6 +191,21 @@ def test_env_init():
     assert test_env.nacomp == 3, "Number of component actions is not correct"
     assert test_env.nobs == 5, "Number of observations is not correct"
     assert test_env.nfail == 3, "Number of failure modes is not correct"
+
+
+def test_seed():
+    env1 = BayesianObservation(gym.make("Maintenance-quay-wall-v0"))
+    env2 = BayesianObservation(gym.make("Maintenance-quay-wall-v0"))
+    # seed_everything(1)
+    for i in range(1, 11):
+        obs1, _ = env1.reset(seed=i)
+        action1 = env1.action_space.sample()
+        obs1, _, _, _, _ = env1.step(action1)
+
+        obs2, _ = env2.reset(seed=i)
+        obs2, _, _, _, _ = env2.step(action1)
+
+        assert np.allclose(obs1, obs2), "Seeding is not working correctly"
 
 
 def test_env_state():
@@ -204,7 +222,3 @@ def test_reset_env_state():
     assert np.equal(test_env.state, test_env.start_S).all(), "State is not reset correctly"
     assert np.equal(test_env.det_rate, np.zeros((13, 1), dtype=int)).all(), \
         "Deterioration rate is not reset correctly"
-
-
-
-
