@@ -3,6 +3,7 @@ from gymnasium.spaces import MultiDiscrete, Box
 from gymnasium.utils import EzPickle
 import numpy as np
 from .scenario import Scenario
+import pandas as pd
 from typing import Tuple, Optional, Dict, Any
 
 
@@ -60,10 +61,11 @@ class MaintenanceEnv(gym.Env, EzPickle):
 
     def __init__(self, ncomp: int, ndeterioration: int, ntypes: int, nstcomp: int, naglobal: int, nacomp: int,
                  nobs: int, nfail: int, P: np.ndarray, O: np.ndarray, C_glo: np.ndarray, C_rep: np.ndarray,
-                 comp_setup: np.ndarray, f_modes: np.ndarray, start_S: np.ndarray, total_cost: float, ep_length: int,
-                 render_mode: Optional[str] = None):
+                 comp_setup: np.ndarray, f_modes: Tuple, f_modes_probs: Tuple, start_S: np.ndarray,
+                 total_cost: float, ep_length: int, render_mode: Optional[str] = None):
         EzPickle.__init__(self, render_mode=render_mode)
         self.render_mode = render_mode
+        self.f_modes_probs = f_modes_probs
         self.ncomp = ncomp
         self.start_S = start_S
         self.ndeterioration = ndeterioration
@@ -94,6 +96,9 @@ class MaintenanceEnv(gym.Env, EzPickle):
         self.det_rate = np.zeros((self.ncomp, 1), dtype=int)
         self.scenario = None
         self.curr_step = 0
+        self.action_taken = None
+        self.state_prev = None
+        self.obs_rec = None
 
     def get_action(self, action: np.ndarray) -> Tuple[np.ndarray, int]:
         """
@@ -113,6 +118,11 @@ class MaintenanceEnv(gym.Env, EzPickle):
         """
         action_comp, action_glob = action[:-1], action[-1]
         return action_comp, action_glob
+
+    def add_state_action(self, action: np.ndarray, state: np.ndarray, obs: np.ndarray) -> None:
+        self.action_taken[self.curr_step] = np.copy(action)
+        self.state_prev[self.curr_step] = np.copy(state)
+        self.obs_rec[self.curr_step] = np.copy(obs)
 
     def reset(self, scenario: Optional[Scenario] = None, options: Optional[Dict[str, Any]] = None,
               seed: Optional[int] = None, **kwargs) -> Tuple[np.ndarray, Dict[str, Any]]:
@@ -145,7 +155,13 @@ class MaintenanceEnv(gym.Env, EzPickle):
             self.state = np.copy(self.start_S)
             self.det_rate = np.zeros((self.ncomp, 1), dtype=int)
         self.curr_step = 0
-        return self.observation(self.state, 0, np.zeros(self.ncomp)), {"state": self.state}
+        self.action_taken = np.zeros((self.ep_length + 1, self.ncomp + 1), dtype=int)
+        self.state_prev = np.zeros((self.ep_length + 1, self.ncomp, self.nstcomp), dtype=int)
+        self.obs_rec = np.zeros((self.ep_length + 1, 2, self.ncomp), dtype=int)
+        self.state_prev[self.curr_step] = np.copy(self.state)
+        start_obs = self.observation(self.state, 0, np.zeros(self.ncomp))
+        self.obs_rec[self.curr_step] = np.copy(start_obs)
+        return start_obs, {"state": self.state}
 
     def step(self, action: np.ndarray) -> Tuple[np.ndarray, np.ndarray, bool, bool, Dict[str, Any]]:
         """
@@ -188,9 +204,89 @@ class MaintenanceEnv(gym.Env, EzPickle):
         return_observation[1] = self.det_rate.T
 
         reward = np.array([cost, failure_cost])
+
         self.curr_step += 1
+        self.add_state_action(action, self.state, return_observation)
+
         done = self.curr_step >= self.ep_length
         return return_observation, reward, terminated, done, {"state": self.state}
+
+    def get_episode(self) -> pd.DataFrame:
+        """
+        Returns the episode as a pandas DataFrame with the belief, the real state, the observations, and
+        the actions taken.
+        Returns:
+        -------
+        episode: pandas DataFrame
+            The episode as a pandas DataFrame.
+        -------
+        """
+        obs_rec = self.obs_rec
+        states = self.state_prev
+        actions = self.action_taken
+        df_dict = {"timestep": list(range(self.ep_length + 1))}
+        for i in range(self.ncomp):
+
+            df_dict[f"obs_comp_{i}"] = obs_rec[:, 0, i]
+            df_dict[f"obs_det_rate_comp_{i}"] = obs_rec[:, 1, i]
+            df_dict[f"action_comp_{i}"] = actions[:, i]
+            for j in range(self.nstcomp):
+                df_dict[f"state_comp_{i}_state_{j}"] = states[:, i, j]
+        df_dict["global_action"] = actions[:, self.ncomp]
+        # print(df_dict)
+        episode = pd.DataFrame(df_dict)
+        return episode
+
+    # def failure_mode(self, s: np.ndarray) -> float:
+    #     """
+    #     Calculates the failure probability of each of the components. The failure probability is calculated based on the
+    #     failure modes of the components. The failure modes are defined in the f_modes variable. The failure modes are
+    #     defined as follows (CURRENTLY EVENTS ARE INDEPENDENT, MIGHT BE DEPENDENT IN THE FUTURE):
+    #     F1: 1 component failed = 0.05
+    #         2 components failed = 0.1
+    #         3 components failed = 0.4
+    #     F2: 1 component failed = 0.02
+    #         2 components failed = 0.33
+    #     F3: 1 component failed = 0.05
+    #
+    #     Parameters:
+    #     ----------
+    #     s : np.ndarray
+    #         Current state of the environment
+    #
+    #     Returns:
+    #     -------
+    #     collapse_fail : float
+    #         Failure probability of the components of the current state
+    #     """
+    #     fail_state = (np.argmax(s, axis=1) == self.nstcomp - 1).astype(int)
+    #     fail_prob = 1
+    #     # FAIL MODE 1
+    #     for i in range(self.f_modes[0].shape[0]):
+    #         n_fail = np.sum(fail_state[self.f_modes[0][i, :]])
+    #
+    #         if n_fail == 1:
+    #             fail_prob *= (1 - 0.01)
+    #         elif n_fail == 2:
+    #             fail_prob *= (1 - 0.10)
+    #         elif n_fail == 3:
+    #             fail_prob *= (1 - 0.40)
+    #     # FAIL MODE 2
+    #     for i in range(self.f_modes[1].shape[0]):
+    #
+    #         n_fail = np.sum(fail_state[self.f_modes[1][i, :]])
+    #
+    #         if n_fail == 1:
+    #             fail_prob *= (1 - 0.03)
+    #         elif n_fail == 2:
+    #             fail_prob *= (1 - 0.33)
+    #     # FAIL MODE 3
+    #     for i in range(self.f_modes[2].shape[0]):
+    #         n_fail = np.sum(fail_state[self.f_modes[2][i, :]])
+    #         if n_fail == 1:
+    #             fail_prob *= (1 - 0.05)
+    #     collapse_fail = np.log(fail_prob)
+    #     return collapse_fail
 
     def failure_mode(self, s: np.ndarray) -> float:
         """
@@ -214,54 +310,15 @@ class MaintenanceEnv(gym.Env, EzPickle):
         collapse_fail : float
             Failure probability of the components of the current state
         """
-        fail_state_before = (np.argmax(s, axis=1) == self.nstcomp - 2).astype(int)
         fail_state = (np.argmax(s, axis=1) == self.nstcomp - 1).astype(int)
         fail_prob = 1
         # FAIL MODE 1
-        for i in range(self.f_modes[0].shape[0]):
-            n_almost_fail = np.sum(fail_state_before[self.f_modes[0][i, :]])
-            n_fail = np.sum(fail_state[self.f_modes[0][i, :]])
-            if n_almost_fail == 1 and n_fail == 0:
-                fail_prob *= (1 - 0.001)
-            elif n_almost_fail == 2 and n_fail == 0:
-                fail_prob *= (1 - 0.008)
-            elif n_almost_fail == 3 and n_fail == 0:
-                fail_prob *= (1 - 0.015)
-            elif n_fail == 1 and n_almost_fail == 0:
-                fail_prob *= (1 - 0.01)
-            elif n_fail == 1 and n_almost_fail == 1:
-                fail_prob *= (1 - 0.015)
-            elif n_fail == 1 and n_almost_fail == 2:
-                fail_prob *= (1 - 0.03)
-            elif n_fail == 2 and n_almost_fail == 0:
-                fail_prob *= (1 - 0.10)
-            elif n_fail == 2 and n_almost_fail == 1:
-                fail_prob *= (1 - 0.20)
-            elif n_fail == 3:
-                fail_prob *= (1 - 0.40)
-        # FAIL MODE 2
-        for i in range(self.f_modes[1].shape[0]):
-            n_almost_fail = np.sum(fail_state_before[self.f_modes[0][i, :]])
-            n_fail = np.sum(fail_state[self.f_modes[1][i, :]])
-            if n_fail == 0 and n_almost_fail == 1:
-                fail_prob *= (1 - 0.003)
-            elif n_fail == 0 and n_almost_fail == 2:
-                fail_prob *= (1 - 0.025)
-            elif n_fail == 1 and n_almost_fail == 0:
-                fail_prob *= (1 - 0.03)
-            elif n_fail == 1 and n_almost_fail == 1:
-                fail_prob *= (1 - 0.05)
-            elif n_fail == 2:
-                fail_prob *= (1 - 0.33)
-        # FAIL MODE 3
-        for i in range(self.f_modes[2].shape[0]):
-            n_almost_fail = np.sum(fail_state_before[self.f_modes[0][i, :]])
-            n_fail = np.sum(fail_state[self.f_modes[2][i, :]])
-            if n_almost_fail == 1:
-                fail_prob *= (1 - 0.005)
-            elif n_fail == 1:
-                fail_prob *= (1 - 0.05)
+        for f_mode, f_prob in zip(self.f_modes, self.f_modes_probs):
+            for i in range(f_mode.shape[0]):
+                n_fail = np.sum(fail_state[f_mode[i, :]])
+                fail_prob *= (1 - f_prob[n_fail])
         collapse_fail = np.log(fail_prob)
+
         return collapse_fail
 
     def state_prime(self, s: np.ndarray, a: np.ndarray) -> np.ndarray:

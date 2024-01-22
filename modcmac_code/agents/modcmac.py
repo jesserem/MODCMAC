@@ -85,7 +85,7 @@ class MODCMAC(MODCMACBase):
                  e_coef: float = 0.01, clip_grad_norm: Optional[int] = None, do_eval_every: int = 1000,
                  use_accrued_reward: bool = True, n_eval: int = 100, log_run: bool = True,
                  obj_names: Optional[List[str]] = None, project_name: str = "modcmac", continuous: bool = False,
-                 normalize_advantage: bool = True, seed: Optional[int] = None):
+                 normalize_advantage: bool = True, seed: Optional[int] = None, print_values: bool = True):
         super().__init__(pnet=pnet,
                          vnet=vnet,
                          env=env,
@@ -97,6 +97,7 @@ class MODCMAC(MODCMACBase):
                          buffer_size=buffer_size,
                          gamma=gamma,
                          name=name,
+                         print_values=print_values,
                          save_folder=save_folder,
                          use_lr_scheduler=use_lr_scheduler,
                          num_steps=num_steps,
@@ -153,11 +154,13 @@ class MODCMAC(MODCMACBase):
         }
 
     def calculate_target(self, p_ns: torch.Tensor, returns: torch.Tensor) -> torch.Tensor:
-        tz = torch.stack(
-            [returns[..., o].clamp(min=self.v_min[o], max=self.v_max[o]) for o in range(len(self.v_min))], dim=-1)
+        tz = torch.stack([returns[..., o].clamp(min=self.v_min[o], max=self.v_max[o]) for o in range(len(self.v_min))],
+                         dim=-1)
         b = (tz - self.v_min) / self.d_z
         l = torch.floor(b).long()
         # change b to not be exactly on border of categories
+        b = torch.where(b != l, b, b + self.d_z / 100)
+        b = b.clamp(min=0, max=self.c - 1)
         b = torch.where(b != l, b, b - self.d_z / 100)
         b = b.clamp(min=0, max=self.c - 1)
         u = torch.ceil(b).long()
@@ -206,11 +209,9 @@ class MODCMAC(MODCMACBase):
 
     def learn_critic(self, batch):
         with torch.no_grad():
-            p_ns = self.Vnet(batch.next_observation.squeeze(1))
-
+            p_ns = self.Vnet(batch.next_observation)
             non_terminal = torch.logical_not(batch.terminal).unsqueeze(1)
             s_ = batch.reward.shape
-
             # [Batch C51 nO]
             returns = batch.reward.unsqueeze(1).expand(s_[0], self.c, s_[1]).clone()
 
@@ -221,7 +222,6 @@ class MODCMAC(MODCMACBase):
                 # if episode ended in last n-steps, do not add to return
                 returns[i - 1] += self.gamma * returns[i] * non_terminal[i - 1]
             # print("returns original", returns[0])
-
             m = self.calculate_target(p_ns, returns)
 
         p_s = self.Vnet(batch.observation)

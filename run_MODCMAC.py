@@ -5,6 +5,7 @@ from modcmac_code.agents.modcmac import MODCMAC
 import gymnasium as gym
 from modcmac_code.environments.BeliefObservation import BayesianObservation
 from modcmac_code.networks.model import VNet, PNet
+from modcmac_code.utils.utilities import fmeca2, other_uti, other_uti_smooth, other_uti_simple_env
 import pandas as pd
 import argparse
 import signal
@@ -35,7 +36,14 @@ def parse_arguments():
     parser.add_argument("--path_pnet", type=str, default=None, help="Path to policy network.")
     parser.add_argument("--path_vnet", type=str, default=None, help="Path to value network.")
     parser.add_argument("--no_log", action="store_false", help="Flag to not log the run")
+    parser.add_argument("--utility", type=str, default="fmeca", choices=["fmeca", "other", "other_smooth"],
+                        help="Utility function to use.", )
+    parser.add_argument("--env", type=str, default="normal", choices=["normal", "simple", "difficult"],
+                        help="Environment to use.", )
+    parser.add_argument("--no_lr_decay", action="store_false", help="Flag to not decay the learning rate.")
     parser.add_argument("--save_eval_folder", type=str, default=None, help="Folder to save evaluation results.")
+    parser.add_argument("--is_test", action="store_true", help="Flag to test the code.")
+    parser.add_argument('--no_normalize', action='store_false', help='Flag to not normalize the advantage.')
 
     args = parser.parse_args()
     if (args.do_eval and
@@ -50,59 +58,58 @@ def parse_arguments():
     return args
 
 
-def fmeca_log(reward):
-    penalty = torch.tensor(3)
-    cost = torch.abs(reward[:, 0])
-    p_fail = (1 - torch.exp(reward[:, 1]))
-    max_cost = torch.tensor(1.5 * total_cost)
-    max_fail = torch.tensor(0.1)
-    pen_cost = (cost > max_cost)
-    pen_risk = (p_fail > max_fail)
-    cost_log = (1 + torch.log(1 + (cost / max_cost))) + penalty * pen_cost
-    risk_log = (1 + torch.log(1 + (p_fail / max_fail))) + penalty * pen_risk
-    uti = -(cost_log * risk_log).view(-1, 1)
-    return uti
-
-
-def fmeca2(reward):
-    cost = torch.abs(reward[:, 0])
-    p_fail = (1 - torch.exp(reward[:, 1]))
-    max_factor = torch.tensor(6)
-    rate = torch.tensor(10)
-    max_cost = torch.tensor(2)
-    max_fail = torch.tensor(0.2)
-    penalty = torch.tensor(4)
-    pen_cost = (cost > max_cost)
-    pen_risk = (p_fail > max_fail)
-    cost_log = max_factor * -torch.log10(1 / rate) * torch.log10(1 + (cost / max_cost) * 10) + penalty * pen_cost
-    cost_log = torch.clamp(cost_log, min=1)
-    risk_log = max_factor * -torch.log10(1 / rate) * torch.log10(1 + (p_fail / max_fail) * 10) + penalty * pen_risk
-    risk_log = torch.clamp(risk_log, min=1)
-    uti = -(cost_log * risk_log).view(-1, 1)
-    return uti
-
-
 def main():
     args = parse_arguments()
     if args.clip_grad_norm == 0:
         clip_grad_norm = None
     else:
         clip_grad_norm = args.clip_grad_norm
-    env = gym.make("Maintenance-quay-wall-v0")
-    env = BayesianObservation(env)
+    if args.utility == "fmeca":
+        uti_func = fmeca2
+        back_side_name = "fmeca_utility"
+    elif args.utility == "other":
+        # if args.env == "simple":
+        #     uti_func = other_uti_simple_env
+        # else:
+        #     uti_func = other_uti
+        uti_func = other_uti
+        back_side_name = "other_utility"
+    elif args.utility == "other_smooth":
+        uti_func = other_uti_smooth
+        back_side_name = "other_utility_smooth"
+    else:
+        raise ValueError("Utility function not recognized.")
+    if args.env == "normal":
+        env = gym.make("Maintenance-quay-wall-v0")
+        env = BayesianObservation(env)
+        front_name = "modcmac_quay_wall_"
+    elif args.env == "simple":
+        env = gym.make("Maintenance-simple-new-det-v0")
+        env = BayesianObservation(env)
+        front_name = "modcmac_simple_"
+    elif args.env == "difficult":
+        env = gym.make("Maintenance-quay-wall-complex-v0")
+        env = BayesianObservation(env)
+        front_name = "modcmac_quay_wall_complex_"
+    p_name = front_name + back_side_name
+    if args.is_test:
+        p_name = p_name + "_test"
+    print(p_name)
     # exit()
     pnet = PNet(observation_space=env.observation_space, action_space=env.action_space, objectives=2,
-                use_accrued_reward=args.no_accrued_reward)
+                use_accrued_reward=args.no_accrued_reward, global_layers=[150, ], local_layers=[50, ])
     # exit()
     vnet = VNet(observation_space=env.observation_space, c=args.c, objectives=2,
-                use_accrued_reward=args.no_accrued_reward)
-    agent = MODCMAC(pnet, vnet, env, utility=fmeca2, obj_names=['cost', 'risk'], log_run=args.no_log,
+                use_accrued_reward=args.no_accrued_reward, hidden_layers=[150, 150])
+    print(pnet)
+    print(vnet)
+    agent = MODCMAC(pnet, vnet, env, utility=uti_func, obj_names=['cost', 'risk'], log_run=args.no_log,
                     v_min=(args.v_min_cost, args.v_min_risk), v_max=(args.v_max_cost, args.v_max_risk),
                     clip_grad_norm=clip_grad_norm, c=args.c, device=args.device, n_step_update=args.n_step_update,
                     v_coef=args.v_coef, e_coef=args.e_coef, lr_critic=args.lr_critic, do_eval_every=1000,
                     lr_policy=args.lr_policy, use_accrued_reward=args.no_accrued_reward, gamma=args.gamma,
                     save_folder=args.save_folder, name=args.name, num_steps=args.num_steps, eval_only=args.do_eval,
-                    project_name="modcmac_quay_wall")
+                    project_name=p_name, use_lr_scheduler=args.no_lr_decay, normalize_advantage=args.no_normalize)
 
     def signal_handler(sig, frame):
         print('You pressed Ctrl+C!')

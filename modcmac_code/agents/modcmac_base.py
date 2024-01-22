@@ -1,5 +1,7 @@
 import sys
 
+import pandas as pd
+
 from ..distributions.distributions import MultiCategorical, MultiNormal
 import torch
 import torch.optim as optim
@@ -8,7 +10,7 @@ import numpy as np
 from torch.distributions import Categorical, Normal
 from ..replaybuffer.ReplayBuffer import Memory as ReplayBuffer, Transition, BatchTransition
 from datetime import datetime
-from time import time
+from time import time, sleep
 from gymnasium import Env
 from typing import Optional, Union, List, Callable, Tuple
 from torch import nn
@@ -144,11 +146,12 @@ class MODCMACBase:
                  name: str = "MODCMAC_base", save_folder: str = "./models", use_lr_scheduler: bool = True,
                  num_steps: int = 2_500_000, eval_only: bool = False, ep_length: int = 50, n_step_update: int = 1,
                  v_coef: float = 0.5, e_coef: float = 0.01, clip_grad_norm: Optional[int] = None,
-                 do_eval_every: int = 1000, use_accrued_reward: bool = True, update_wandb_step: int = 500,
+                 do_eval_every: int = 1000, use_accrued_reward: bool = True, update_wandb_step: int = 1000,
                  n_eval: int = 100, log_run: bool = False, obj_names: Optional[List[str]] = None,
                  project_name: str = "modcmac_base", continuous: bool = False, normalize_advantage: bool = True,
-                 seed: Optional[int] = None, ):
+                 seed: Optional[int] = None, print_values: bool = True):
         self.seed = seed
+        self.print_values = print_values
         self.np_random = np.random.default_rng(seed)
         self.use_accrued_reward = use_accrued_reward
         self.normalize_advantage = normalize_advantage
@@ -161,7 +164,9 @@ class MODCMACBase:
         self.eval_only = eval_only
         self.log_run = log_run
         if self.seed is not None:
-            self.name = "{name}_seed_{seed}".format(name=name, seed=self.seed)
+            self.name = "{name}_seed_{seed}_date_{date}".format(name=name,
+                                                                seed=self.seed,
+                                                                date=datetime.now().strftime("%Y%m%d-%H%M%S"))
         else:
             self.name = "{name}_{date}".format(name=name, date=datetime.now().strftime("%Y%m%d-%H%M%S"))
         self.total_steps = 0
@@ -228,6 +233,7 @@ class MODCMACBase:
             config=self.hparams,
             save_code=True,
         )
+        pass
         # wandb.define_metric("*", step_metric="global_step")
 
     def close_wandb(self) -> None:
@@ -359,8 +365,8 @@ class MODCMACBase:
 
         return total_reward, i, has_failed, scoring_table
 
-    def evaluate(self, scoring_table: Optional[np.ndarray] = None, run: int = 0) -> Tuple[
-        np.ndarray, int, bool, np.ndarray]:
+    def evaluate(self, scoring_table: Optional[np.ndarray] = None, run: int = 0, gamma_val=1.0) -> Tuple[
+        np.ndarray, np.ndarray, int, bool, np.ndarray]:
         """
         Evaluates the policy on the environment for a single episode.
 
@@ -381,13 +387,17 @@ class MODCMACBase:
         observation = self.create_input(observation, torch.zeros((1, self.n_objectives)))
         accrued = torch.tensor([]).view(0, self.n_objectives)
         total_reward = np.zeros(self.n_objectives)
+        total_discounted_reward = np.zeros(self.n_objectives)
 
         while not done:
             action = self.select_action(observation, training=False)  # select action
 
-            next_observation, reward, done, trunc, info = self.env.step(action.detach().numpy())
+            next_observation, reward, done, trunc, info = self.env.step(action.detach().cpu().numpy())
             done = done or trunc
+            # print(type((gamma_val ** i) * reward))
+            # print(type(reward))
             total_reward += reward
+            total_discounted_reward += (gamma_val ** i) * reward
             gamma = torch.tensor([self.gamma ** i])
             reward_tensor = torch.tensor(reward).float().view(1, self.n_objectives)
             if i == 0:
@@ -399,7 +409,7 @@ class MODCMACBase:
                 has_failed = True
             i += 1
 
-        return total_reward, i, has_failed, scoring_table
+        return total_reward, total_discounted_reward, i, has_failed, self.env.get_episode()
 
     def do_eval(self, episodes: int = 1000) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
@@ -423,18 +433,64 @@ class MODCMACBase:
         reward_risk_array = np.zeros(episodes)
         reward_uti_array = np.zeros(episodes)
         for i in range(episodes):
-            reward, _, _, scoring_table = self.evaluate()
+            reward, _, _, _, scoring_table = self.evaluate()
 
-            total_cost_eval_curr = np.abs(reward[0])
-            total_prob_eval_curr = 1 - np.exp(reward[1])
-            eval_cost_curr = np.abs(self.utility(torch.tensor(reward).view(1, self.n_objectives)).item())
+            total_cost_eval_curr = reward[0]
+            total_prob_eval_curr = reward[1]
+            eval_cost_curr = self.utility(torch.tensor(reward).view(1, self.n_objectives)).item()
             reward_cost_array[i] = total_cost_eval_curr
             reward_risk_array[i] = total_prob_eval_curr
             reward_uti_array[i] = eval_cost_curr
 
         return reward_cost_array, reward_risk_array, reward_uti_array
 
-    def train(self, training_steps: int = 25_000_000, seed: Optional[int] = None) -> None:
+    def do_eval_new_exp(self, episodes: int = 1000, gamma=1.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+    np.ndarray, np.ndarray, List[pd.DataFrame]]:
+        """
+        Evaluates the policy for a number of episodes, and returns the cost, risk and utility for each episode.
+
+        Parameters:
+        -----------
+        episodes : int, optional
+            Number of episodes to evaluate. Default is 1000.
+
+        Returns:
+        --------
+        reward_cost_array : np.ndarray
+            The total cost for each episode.
+        reward_risk_array : np.ndarray
+            The total risk for each episode.
+        reward_uti_array : np.ndarray
+            The total utility for each episode.
+        """
+        reward_cost_array = np.zeros(episodes)
+        reward_risk_array = np.zeros(episodes)
+        reward_uti_array = np.zeros(episodes)
+        discounted_reward_cost_array = np.zeros(episodes)
+        discounted_reward_risk_array = np.zeros(episodes)
+        discounted_reward_uti_array = np.zeros(episodes)
+        pd_frames = []
+        for i in range(episodes):
+            reward, discount_reward, _, _, scoring_table = self.evaluate(gamma_val=gamma)
+            pd_frames.append(scoring_table)
+            total_cost_eval_curr = reward[0]
+            total_prob_eval_curr = reward[1]
+            total_discounted_cost_eval_curr = discount_reward[0]
+            total_discounted_prob_eval_curr = discount_reward[1]
+
+            eval_cost_curr = self.utility(torch.tensor(reward).view(1, self.n_objectives)).item()
+            eval_discounted_cost_curr = self.utility(torch.tensor(discount_reward).view(1, self.n_objectives)).item()
+            reward_cost_array[i] = total_cost_eval_curr
+            reward_risk_array[i] = total_prob_eval_curr
+            reward_uti_array[i] = eval_cost_curr
+            discounted_reward_cost_array[i] = total_discounted_cost_eval_curr
+            discounted_reward_risk_array[i] = total_discounted_prob_eval_curr
+            discounted_reward_uti_array[i] = eval_discounted_cost_curr
+
+        return (reward_cost_array, reward_risk_array, reward_uti_array, discounted_reward_cost_array,
+                discounted_reward_risk_array, discounted_reward_uti_array, pd_frames)
+
+    def train(self, training_steps: int = 25_000_000, seed: Optional[int] = None) -> float:
         """
         Trains the MODCMAC agent for `episodes` amount of episodes.
 
@@ -477,9 +533,10 @@ class MODCMACBase:
 
             while not done:
                 action = self.select_action(observation, training=True)  # select action
-                next_observation, reward, done, trunc, info = self.env.step(action.detach().numpy())
+                next_observation, reward, done, trunc, info = self.env.step(action.detach().cpu().numpy())
                 done = done or trunc
                 gamma = torch.tensor([self.gamma ** i])
+
                 total_reward_discounted += (self.gamma ** i) * reward
                 total_reward += reward
                 reward = torch.tensor(reward, dtype=torch.float32)
@@ -506,14 +563,12 @@ class MODCMACBase:
 
                 observation = next_observation  # set initial observations for next step
                 if (self.total_steps + 1) % self.n_step_update == 0:
-                    with torch.no_grad():
-                        next_value = self.Vnet(observation)
                     loss_p, loss_v, entropy, update_loss = self.learn()
                     self.log.add_losses(loss_p, loss_v, entropy)
                 i += 1
                 self.total_steps += 1
                 # print(curr_step)
-                if self.total_steps % 5000 == 0:
+                if self.print_values and self.total_steps % 5000 == 0:
                     curr_run_time = time() - start_time
                     run_time_per_ep = curr_run_time / self.total_steps
                     eta = run_time_per_ep * (training_steps - self.total_steps)
@@ -551,7 +606,7 @@ class MODCMACBase:
                 Evaluates the policy on the environment for n_eval episodes (n_eval is a parameter of the class)
                 """
                 for ne in range(self.n_eval):
-                    reward, n, has_failed, _ = self.evaluate()
+                    reward, _, n, has_failed, _ = self.evaluate()
                     eval_cost_curr = self.utility(torch.tensor(reward).view(1, self.n_objectives)).item()
                     reward_array[ne] = reward
                     reward_uti_array[ne] = eval_cost_curr
@@ -561,6 +616,7 @@ class MODCMACBase:
                 if self.log_run:
                     wandb_dict = {
                         f"evaluation/Utility": utility_mean,
+                        f"Utility": utility_mean,
                         f"evaluation/Utility_std": utility_std,
 
                     }
@@ -568,14 +624,15 @@ class MODCMACBase:
                         wandb_dict[f"evaluation/{self.obj_names[n_o]}"] = np.mean(reward_array[:, n_o])
                         wandb_dict[f"evaluation/{self.obj_names[n_o]}_std"] = np.std(reward_array[:, n_o])
                     wandb.log(wandb_dict, step=self.total_steps)
-
-                print("\n----------------------------------------------------------")
-                print_mes = (f"The evaluation at step {self.total_steps} returned:\n" +
-                             f"Utility: {np.round(utility_mean, 3)} SD={np.round(utility_std, 3)}\n")
-                for n_o in range(self.n_objectives):
-                    print_mes += f"{self.obj_names[n_o]}: {np.round(np.mean(reward_array[:, n_o]), 3)} SD={np.round(np.std(reward_array[:, n_o]), 3)}\n"
-                print(print_mes)
-                print("----------------------------------------------------------\n")
+                if self.print_values:
+                    print("\n----------------------------------------------------------")
+                    print_mes = (f"The evaluation at step {self.total_steps} returned:\n" +
+                                 f"Utility: {np.round(utility_mean, 3)} SD={np.round(utility_std, 3)}\n")
+                    for n_o in range(self.n_objectives):
+                        print_mes += (f"{self.obj_names[n_o]}: {np.round(np.mean(reward_array[:, n_o]), 3)} "
+                                      f"SD={np.round(np.std(reward_array[:, n_o]), 3)}\n")
+                    print(print_mes)
+                    print("----------------------------------------------------------\n")
                 self.save_model()
             if (self.total_steps + 1) % 1_000_000 == 0:
                 self.save_model(name="curr_step_" + str(self.total_steps + 1))
@@ -585,12 +642,12 @@ class MODCMACBase:
             self.log.add_episode(curr_total_uti.item(), curr_total_uti_discounted.item(), total_reward,
                                  total_reward_discounted)
 
-        reward_array = np.zeros((self.n_eval, self.n_objectives))
-        reward_uti_array = np.zeros(self.n_eval)
+        reward_array = np.zeros((1000, self.n_objectives))
+        reward_uti_array = np.zeros(1000)
 
-        for ne in range(self.n_eval):
-            reward, _, has_failed, _ = self.evaluate()
-            eval_uti_curr = np.abs(self.utility(torch.tensor(reward).view(1, self.n_objectives)).item())
+        for ne in range(1000):
+            reward, _, _, has_failed, _ = self.evaluate()
+            eval_uti_curr = self.utility(torch.tensor(reward).view(1, self.n_objectives)).item()
             reward_uti_array[ne] = eval_uti_curr
             reward_array[ne] = reward
 
@@ -600,6 +657,7 @@ class MODCMACBase:
         if self.log_run:
             wand_dict = {
                 f"evaluation/Utility": utility_mean,
+                f"Utility": utility_mean,
                 f"evaluation/Utility_std": utility_std,
             }
             for n_o in range(self.n_objectives):
@@ -609,6 +667,8 @@ class MODCMACBase:
 
         self.save_model("final")
         self.close_wandb()
+        # sleep(60)
+        return utility_mean
 
     def load_model(self, path_pnet: str, path_vnet: str) -> None:
         """
@@ -622,8 +682,11 @@ class MODCMACBase:
             Path to the value network weights.
 
         """
+        print(path_vnet)
+        print(path_pnet)
+        vnet_weights = torch.load(path_vnet)
+        self.Vnet.load_state_dict(vnet_weights)
         self.Pnet.load_state_dict(torch.load(path_pnet))
-        self.Vnet.load_state_dict(torch.load(path_vnet))
 
     def learn_critic(self, batch: BatchTransition) -> Tuple[torch.Tensor, torch.Tensor]:
         raise NotImplementedError

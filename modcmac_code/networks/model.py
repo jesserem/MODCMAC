@@ -13,7 +13,7 @@ class ActionLayer(nn.Module):
 
     def forward(self, x: torch.Tensor):
         output_layer = self.layer(x)
-        output = torch.full((x.shape[0], self.max_dim,), -float("inf"), dtype=output_layer.dtype,
+        output = torch.full((x.shape[0], self.max_dim,), -1e32, dtype=output_layer.dtype,
                             device=output_layer.device)
         output[:output_layer.size(0), :output_layer.size(1)] = output_layer
         return output
@@ -350,6 +350,7 @@ class VNet(nn.Module):
         last_dim = self.input_dim
         layers_list = []
         layers_list.append(nn.Linear(last_dim, hidden_layers[0]))
+        layers_list.append(activation())
         last_dim = hidden_layers[0]
         for i in range(1, len(hidden_layers)):
             layer_dim = hidden_layers[i]
